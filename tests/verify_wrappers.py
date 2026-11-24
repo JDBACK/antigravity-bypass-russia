@@ -64,7 +64,8 @@ with tempfile.TemporaryDirectory(prefix="ag wrapper ") as temporary:
                 name = bytes(data[base:base + 8]).rstrip(b"\0").decode("ascii")
                 if name == ".data":
                     raw = int.from_bytes(data[base + 20:base + 24], "little")
-                    magic = b"\xff Go buildinf:" + bytes([8, 0])
+                    # Real Go 1.18+ little-endian inline buildinfo uses flags=0x02.
+                    magic = b"\xff Go buildinf:" + bytes([8, 2])
                     data[raw:raw + len(magic)] = magic
                     pe_path.write_bytes(data)
                     return

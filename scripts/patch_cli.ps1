@@ -149,7 +149,7 @@ function Test-NativeGoCli {
                 while ($at -ge 0) {
                     if ($at + 15 -lt $bytes.Length -and
                         ($bytes[$at + 14] -eq 4 -or $bytes[$at + 14] -eq 8) -and
-                        ($bytes[$at + 15] -band (-bnot 3)) -eq $bytes[$at + 15]) {
+                        ($bytes[$at + 15] -band (-bnot 3)) -eq 0) {
                         return $true
                     }
                     $at = $text.IndexOf($marker, $at + 1, [StringComparison]::Ordinal)
@@ -164,12 +164,27 @@ function Test-NativeGoCli {
     }
 }
 
+function Test-MiseShim {
+    param([string]$Path)
+    $leaf = Split-Path -Leaf $Path
+    return (($leaf -like 'mise*') -or ($Path -like '*\mise\shims\*'))
+}
+
 function Resolve-MiseShim {
-    param([string]$MiseBin, [string]$Name)
-    try { $candidate = (& $MiseBin which $Name 2>$null | Select-Object -First 1) } catch { return $null }
+    param([string]$ShimPath, [string]$Name)
+    $toolName = [IO.Path]::GetFileNameWithoutExtension($Name)
+    $miseExe = $null
+    if ((Split-Path -Leaf $ShimPath) -like 'mise*') {
+        $miseExe = $ShimPath
+    } else {
+        $cmd = Get-Command mise.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd) { $miseExe = $cmd.Source }
+    }
+    if (-not $miseExe) { return $null }
+    try { $candidate = (& $miseExe which $toolName 2>$null | Select-Object -First 1) } catch { return $null }
     if ($candidate -and (Test-Path -LiteralPath "$candidate" -PathType Leaf)) {
         $resolved = Resolve-CliPath "$candidate"
-        if ((Split-Path -Leaf $resolved) -notlike 'mise*') { return $resolved }
+        if (-not (Test-MiseShim $resolved)) { return $resolved }
     }
     return $null
 }
@@ -180,7 +195,15 @@ function Find-Cli {
         if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
             Fail "Файл не найден: $Candidate"
         }
-        return (Resolve-CliPath $Candidate)
+        $resolved = Resolve-CliPath $Candidate
+        if (Test-MiseShim $resolved) {
+            $unwrapped = Resolve-MiseShim $resolved (Split-Path -Leaf $Candidate)
+            if (-not $unwrapped) {
+                Fail "Не удалось разрешить mise-shim: $Candidate"
+            }
+            return $unwrapped
+        }
+        return $resolved
     }
 
     # 1) PATH lookup: unwrap shims, then accept only a real native Go binary
@@ -191,7 +214,7 @@ function Find-Cli {
             Select-Object -First 1
         if (-not $cmd) { continue }
         $resolved = Resolve-CliPath $cmd.Source
-        if ((Split-Path -Leaf $resolved) -like 'mise*') {
+        if (Test-MiseShim $resolved) {
             $resolved = Resolve-MiseShim $resolved $name
             if (-not $resolved) { continue }
         }
@@ -229,8 +252,8 @@ function Find-Cli {
     foreach ($item in $fallbacks) {
         if (Test-Path -LiteralPath $item -PathType Leaf) {
             $resolved = Resolve-CliPath $item
-            if ((Split-Path -Leaf $resolved) -like 'mise*') {
-                $resolved = Resolve-MiseShim $resolved ([IO.Path]::GetFileNameWithoutExtension($item))
+            if (Test-MiseShim $resolved) {
+                $resolved = Resolve-MiseShim $resolved (Split-Path -Leaf $item)
                 if (-not $resolved) { continue }
             }
             if (Test-NativeGoCli $resolved) { return $resolved }
