@@ -221,113 +221,436 @@ pub fn no_window(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+#[cfg(target_os = "macos")]
 pub fn stop_process_by_name(process_name: &str) {
-    #[cfg(target_os = "windows")]
-    {
-        let clean_name = process_name.trim_end_matches(".exe");
-        let exe_name = format!("{}.exe", clean_name);
-        let _ = crate::system::command::output("taskkill", ["/F", "/T", "/IM", &exe_name]);
-        stop_processes_by_names(&[clean_name, &exe_name]);
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = crate::system::command::output("killall", ["-9", process_name]);
-        let _ = crate::system::command::output("pkill", ["-9", "-x", process_name]);
-    }
+    let _ = crate::system::command::output("killall", ["-9", process_name]);
+    let _ = crate::system::command::output("pkill", ["-9", "-x", process_name]);
 }
 
-#[cfg(target_os = "windows")]
-pub fn stop_processes_by_names(names: &[&str]) -> usize {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStringExt;
+/// One Toolhelp row: PID, parent PID and the lower-cased image file name.
+#[cfg(any(windows, test))]
+#[derive(Clone)]
+struct ProcessEntry {
+    pid: u32,
+    parent: u32,
+    image: String,
+}
 
-    const TH32CS_SNAPPROCESS: u32 = 0x00000002;
-    const PROCESS_TERMINATE: u32 = 0x0001;
-    const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1isize as *mut std::ffi::c_void;
-
-    #[repr(C)]
-    struct ProcessEntry32W {
-        dw_size: u32,
-        cnt_usage: u32,
-        th32_process_id: u32,
-        th32_default_heap_id: usize,
-        th32_module_id: u32,
-        cnt_threads: u32,
-        th32_parent_process_id: u32,
-        pc_pri_class_base: i32,
-        dw_flags: u32,
-        sz_exe_file: [u16; 260],
+#[cfg(windows)]
+fn process_entries() -> Result<Vec<ProcessEntry>, String> {
+    use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, System::Diagnostics::ToolHelp::*};
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "Список процессов: {}",
+            std::io::Error::last_os_error()
+        ));
     }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> *mut std::ffi::c_void;
-        fn Process32FirstW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
-        fn Process32NextW(hSnapshot: *mut std::ffi::c_void, lppe: *mut ProcessEntry32W) -> i32;
-        fn OpenProcess(
-            dwDesiredAccess: u32,
-            bInheritHandle: i32,
-            dwProcessId: u32,
-        ) -> *mut std::ffi::c_void;
-        fn TerminateProcess(hProcess: *mut std::ffi::c_void, uExitCode: u32) -> i32;
-        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    let snapshot = Handle(raw);
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+    let mut entries = Vec::new();
+    let mut more = unsafe { Process32FirstW(snapshot.0, &mut entry) };
+    while more != 0 {
+        let length = entry
+            .szExeFile
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(entry.szExeFile.len());
+        entries.push(ProcessEntry {
+            pid: entry.th32ProcessID,
+            parent: entry.th32ParentProcessID,
+            image: String::from_utf16_lossy(&entry.szExeFile[..length]).to_lowercase(),
+        });
+        more = unsafe { Process32NextW(snapshot.0, &mut entry) };
     }
+    Ok(entries)
+}
 
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
-    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
-        return 0;
-    }
+#[cfg(any(windows, test))]
+fn matches_image(entry: &ProcessEntry, image: &str, own_pid: u32) -> bool {
+    entry.pid != 0 && entry.pid != own_pid && entry.image.eq_ignore_ascii_case(image)
+}
 
-    let mut entry = ProcessEntry32W {
-        dw_size: std::mem::size_of::<ProcessEntry32W>() as u32,
-        cnt_usage: 0,
-        th32_process_id: 0,
-        th32_default_heap_id: 0,
-        th32_module_id: 0,
-        cnt_threads: 0,
-        th32_parent_process_id: 0,
-        pc_pri_class_base: 0,
-        dw_flags: 0,
-        sz_exe_file: [0u16; 260],
-    };
-
-    let mut killed = 0;
-    let my_pid = std::process::id();
-    let target_names_lower: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
-
-    if unsafe { Process32FirstW(snapshot, &mut entry) } != 0 {
-        loop {
-            if entry.th32_process_id != my_pid && entry.th32_process_id != 0 {
-                let null_pos = entry
-                    .sz_exe_file
-                    .iter()
-                    .position(|&c| c == 0)
-                    .unwrap_or(entry.sz_exe_file.len());
-                let exe_name = OsString::from_wide(&entry.sz_exe_file[..null_pos])
-                    .to_string_lossy()
-                    .to_lowercase();
-
-                if target_names_lower
-                    .iter()
-                    .any(|target| target == &exe_name || target == &format!("{}.exe", exe_name))
-                {
-                    let h_proc =
-                        unsafe { OpenProcess(PROCESS_TERMINATE, 0, entry.th32_process_id) };
-                    if !h_proc.is_null() {
-                        if unsafe { TerminateProcess(h_proc, 1) } != 0 {
-                            killed += 1;
-                        }
-                        unsafe { CloseHandle(h_proc) };
-                    }
-                }
-            }
-
-            if unsafe { Process32NextW(snapshot, &mut entry) } == 0 {
-                break;
+/// Matching processes first, then all of their descendants, as `taskkill /T /IM`
+/// selects them. The current process is never included.
+#[cfg(any(windows, test))]
+fn process_tree(entries: &[ProcessEntry], image: &str, own_pid: u32) -> Vec<u32> {
+    let mut selected: Vec<u32> = entries
+        .iter()
+        .filter(|entry| matches_image(entry, image, own_pid))
+        .map(|entry| entry.pid)
+        .collect();
+    let mut next = 0;
+    while next < selected.len() {
+        let parent = selected[next];
+        next += 1;
+        for entry in entries {
+            if entry.parent == parent
+                && entry.pid != 0
+                && entry.pid != own_pid
+                && entry.pid != parent
+                && !selected.contains(&entry.pid)
+            {
+                selected.push(entry.pid);
             }
         }
     }
+    selected
+}
 
-    unsafe { CloseHandle(snapshot) };
-    killed
+/// Whether a process with this image file name runs from `expected`. The
+/// rule matches `terminate_image_tree`, so a same-named copy elsewhere (a dev
+/// build, an unpacked archive) neither counts as the service nor blocks it.
+/// A process whose path cannot be read (a SYSTEM service seen without admin
+/// rights) counts as running, as a name match always did.
+#[cfg(windows)]
+pub fn image_running_at(image: &str, expected: &std::path::Path) -> Result<bool, String> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let own_pid = std::process::id();
+    Ok(process_entries()?
+        .iter()
+        .filter(|entry| matches_image(entry, image, own_pid))
+        .any(|entry| {
+            let raw = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, entry.pid) };
+            if raw.is_null() {
+                return true;
+            }
+            let handle = Handle(raw);
+            image_path(handle.0).is_none_or(|path| same_image_path(&path, expected))
+        }))
+}
+
+/// Descendants of `roots` that are provably theirs. Windows reuses PIDs, so a
+/// recorded parent PID may now belong to an unrelated, newer process: a child
+/// counts only if it was created no earlier than the parent it points to. Both
+/// creation times come from handles held open, which pins each PID.
+#[cfg(any(windows, test))]
+fn verified_tree(
+    entries: &[ProcessEntry],
+    roots: &[u32],
+    created: &std::collections::HashMap<u32, u64>,
+    own_pid: u32,
+) -> Vec<u32> {
+    let mut selected: Vec<u32> = roots.to_vec();
+    let mut next = 0;
+    while next < selected.len() {
+        let parent = selected[next];
+        next += 1;
+        let Some(parent_created) = created.get(&parent) else {
+            continue;
+        };
+        for entry in entries {
+            if entry.parent != parent
+                || entry.pid == 0
+                || entry.pid == own_pid
+                || entry.pid == parent
+                || selected.contains(&entry.pid)
+            {
+                continue;
+            }
+            if created
+                .get(&entry.pid)
+                .is_some_and(|child_created| child_created >= parent_created)
+            {
+                selected.push(entry.pid);
+            }
+        }
+    }
+    selected
+}
+
+/// A handle that can terminate and wait for one process, with its creation time.
+#[cfg(windows)]
+fn open_for_termination(pid: u32) -> Option<(Handle, u64)> {
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{
+            GetProcessTimes, OpenProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        },
+    };
+    let raw = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if raw.is_null() {
+        return None;
+    }
+    let handle = Handle(raw);
+    // An exited process keeps its PID only while handles exist; skip it.
+    if unsafe { WaitForSingleObject(handle.0, 0) } == 0 {
+        return None;
+    }
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut creation, mut exit, mut kernel, mut user) = (zero, zero, zero, zero);
+    if unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let created = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    Some((handle, created))
+}
+
+#[cfg(windows)]
+fn same_image_path(actual: &std::path::Path, expected: &std::path::Path) -> bool {
+    // Canonical forms also resolve 8.3 short names and differing separators.
+    let canonical = |path: &std::path::Path| std::fs::canonicalize(path).unwrap_or(path.into());
+    canonical(actual)
+        .as_os_str()
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&canonical(expected).as_os_str().to_string_lossy())
+}
+
+/// Native `taskkill /F /T /IM`, restricted to provable members of the tree:
+/// roots must run `expected` (when given), descendants must be newer than
+/// their parent, and every process is terminated through the handle that was
+/// verified. Waits up to `wait` for them to exit.
+#[cfg(windows)]
+pub fn terminate_image_tree(
+    image: &str,
+    expected: Option<&std::path::Path>,
+    wait: std::time::Duration,
+) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+    let own_pid = std::process::id();
+    // Open every candidate first; an open handle keeps its PID from reuse.
+    let candidates = process_tree(&process_entries()?, image, own_pid);
+    let mut held = std::collections::HashMap::new();
+    for pid in candidates {
+        if let Some(opened) = open_for_termination(pid) {
+            held.insert(pid, opened);
+        }
+    }
+    // Parent links are read again while the handles pin those PIDs.
+    let entries = process_entries()?;
+    let roots: Vec<u32> = entries
+        .iter()
+        .filter(|entry| matches_image(entry, image, own_pid))
+        .filter_map(|entry| {
+            let (handle, _) = held.get(&entry.pid)?;
+            let path = image_path(handle.0)?;
+            expected
+                .is_none_or(|expected| same_image_path(&path, expected))
+                .then_some(entry.pid)
+        })
+        .collect();
+    let created = held
+        .iter()
+        .map(|(pid, (_, created))| (*pid, *created))
+        .collect();
+    let mut tree = verified_tree(&entries, &roots, &created, own_pid);
+    let deadline = std::time::Instant::now() + wait;
+    let mut start = 0;
+    // A member may start a child between the snapshot and its own termination
+    // (cmd.exe launching ping, a server launching a helper). Once the members
+    // have exited, look for such children while their handles still pin the
+    // PIDs, and stop them too, until a pass finds none.
+    loop {
+        for pid in &tree[start..] {
+            if let Some((handle, _)) = held.get(pid) {
+                unsafe {
+                    TerminateProcess(handle.0, 1);
+                }
+            }
+        }
+        for pid in &tree[start..] {
+            if let Some((handle, _)) = held.get(pid) {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                unsafe {
+                    WaitForSingleObject(
+                        handle.0,
+                        remaining.as_millis().min(u32::MAX as u128) as u32,
+                    );
+                }
+            }
+        }
+        start = tree.len();
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        for entry in process_entries()? {
+            if entry.pid == 0 || entry.pid == own_pid || tree.contains(&entry.pid) {
+                continue;
+            }
+            let Some((_, parent_created)) = held.get(&entry.parent) else {
+                continue;
+            };
+            let parent_created = *parent_created;
+            if !tree.contains(&entry.parent) {
+                continue;
+            }
+            if let Some(opened) = open_for_termination(entry.pid) {
+                if opened.1 >= parent_created {
+                    held.insert(entry.pid, opened);
+                    tree.push(entry.pid);
+                }
+            }
+        }
+        if start == tree.len() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    fn entry(pid: u32, parent: u32, image: &str) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            parent,
+            image: image.into(),
+        }
+    }
+
+    #[test]
+    fn tree_selects_matching_images_and_descendants_but_never_self() {
+        let entries = [
+            entry(4, 0, "system"),
+            entry(100, 4, "ag_dns.exe"),
+            entry(200, 100, "powershell.exe"),
+            entry(300, 200, "conhost.exe"),
+            entry(400, 4, "AG_DNS.EXE"),
+            entry(500, 4, "explorer.exe"),
+            entry(600, 500, "powershell.exe"),
+            entry(700, 100, "patcher.exe"),
+            entry(800, 800, "ag_dns.exe"),
+        ];
+        let mut tree = process_tree(&entries, "ag_dns.exe", 700);
+        tree.sort_unstable();
+        assert_eq!(tree, [100, 200, 300, 400, 800]);
+        assert!(process_tree(&entries, "missing.exe", 700).is_empty());
+    }
+
+    #[test]
+    fn reused_parent_pid_does_not_adopt_an_older_process() {
+        // 100 is the relay (created at t=50). 200 is its real child (t=60).
+        // 300 recorded parent 100 long ago (t=10), before the PID was reused.
+        let entries = [
+            entry(100, 4, "ag_dns.exe"),
+            entry(200, 100, "powershell.exe"),
+            entry(250, 200, "conhost.exe"),
+            entry(300, 100, "editor.exe"),
+            entry(400, 300, "child-of-editor.exe"),
+            entry(500, 100, "unverifiable.exe"),
+        ];
+        let created = [(100, 50), (200, 60), (250, 61), (300, 10), (400, 70)]
+            .into_iter()
+            .collect();
+        let mut tree = verified_tree(&entries, &[100], &created, 1);
+        tree.sort_unstable();
+        // 300 is older than 100, so neither it nor its child is touched; 500
+        // could not be opened and verified.
+        assert_eq!(tree, [100, 200, 250]);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tree_windows_tests {
+    #[test]
+    fn same_image_name_from_another_folder_is_left_running() {
+        use std::os::windows::process::CommandExt;
+        let image = format!("ag_tree_other_{}.exe", std::process::id());
+        let system = std::env::var_os("SystemRoot").unwrap();
+        let cmd = std::path::Path::new(&system).join(r"System32\cmd.exe");
+        let expected_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let expected = expected_dir.path().join(&image);
+        let other = other_dir.path().join(&image);
+        std::fs::copy(&cmd, &expected).unwrap();
+        std::fs::copy(&cmd, &other).unwrap();
+        let spawn = |path: &std::path::Path| {
+            // No inherited handles: ping outlives a killed cmd.exe and would otherwise keep
+            // the test harness's stdout open, stalling whoever reads it for ~29s.
+            std::process::Command::new(path)
+                .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+                .creation_flags(0x0800_0000)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut wanted = spawn(&expected);
+        let mut stranger = spawn(&other);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(super::image_running_at(&image, &expected).unwrap());
+        super::terminate_image_tree(&image, Some(&expected), std::time::Duration::from_secs(2))
+            .unwrap();
+        assert!(wanted.try_wait().unwrap().is_some());
+        let survived = stranger.try_wait().unwrap().is_none();
+        // The copy left running is not mistaken for the stopped service, so
+        // rollback and restart do not wait for it.
+        let blocked = super::image_running_at(&image, &expected).unwrap();
+        // Stop the stranger's whole tree (cmd.exe and its ping), not just cmd.exe.
+        let _ =
+            super::terminate_image_tree(&image, Some(&other), std::time::Duration::from_secs(2));
+        let _ = stranger.kill();
+        let _ = stranger.wait();
+        assert!(survived, "a process from another folder was terminated");
+        assert!(
+            !blocked,
+            "a process from another folder counted as the service"
+        );
+    }
+
+    #[test]
+    fn image_tree_termination_stops_the_process_and_its_children() {
+        use std::os::windows::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let image = format!("ag_tree_test_{}.exe", std::process::id());
+        let shell = dir.path().join(&image);
+        let system = std::env::var_os("SystemRoot").unwrap();
+        std::fs::copy(
+            std::path::Path::new(&system).join(r"System32\cmd.exe"),
+            &shell,
+        )
+        .unwrap();
+        let mut parent = std::process::Command::new(&shell)
+            .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let children = loop {
+            let entries = super::process_entries().unwrap();
+            let tree = super::process_tree(&entries, &image, std::process::id());
+            if tree.len() > 1 || std::time::Instant::now() > deadline {
+                break tree;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert!(
+            children.len() > 1,
+            "child process did not start: {children:?}"
+        );
+        assert!(super::image_running_at(&image, &shell).unwrap());
+
+        super::terminate_image_tree(&image, Some(&shell), std::time::Duration::from_secs(2))
+            .unwrap();
+
+        assert!(parent.try_wait().unwrap().is_some());
+        assert!(!super::image_running_at(&image, &shell).unwrap());
+        let alive = super::process_entries().unwrap();
+        for pid in &children {
+            assert!(
+                alive.iter().all(|entry| entry.pid != *pid),
+                "PID {pid} survived"
+            );
+        }
+        // The ping cmd.exe starts may appear after the snapshot above; it must not survive either.
+        assert!(
+            alive.iter().all(|entry| !(entry.parent == parent.id()
+                && entry.image.eq_ignore_ascii_case("PING.EXE"))),
+            "a child started during termination survived"
+        );
+    }
 }

@@ -172,7 +172,13 @@ pub fn ensure_admin() {
                 std::process::exit(code as i32);
             }
         }
-        println!("\x1b[31m[!] Требуются права Администратора (UAC отклонен).\x1b[0m");
+        println!(
+            "  {}",
+            crate::ui::style::status(
+                crate::ui::style::Tone::Error,
+                "Нужны права администратора: запрос Windows отклонён. Запустите утилиту ещё раз и нажмите «Да».",
+            )
+        );
         std::process::exit(1);
     }
 
@@ -257,7 +263,7 @@ pub fn ensure_admin() {
 
 /// Microsoft CRT argument escaping, including a path ending with backslashes.
 #[cfg(any(windows, test))]
-fn windows_arguments(args: Vec<Vec<u16>>) -> Vec<u16> {
+pub(super) fn windows_arguments(args: Vec<Vec<u16>>) -> Vec<u16> {
     let mut out = Vec::new();
     for (i, arg) in args.into_iter().enumerate() {
         if i > 0 {

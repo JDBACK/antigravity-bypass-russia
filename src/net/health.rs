@@ -1,11 +1,13 @@
-use super::route_health::{self, Key};
-use native_tls::{TlsConnector, TlsStream};
+use native_tls::TlsConnector;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
-pub const PROBE_BUDGET: Duration = Duration::from_millis(2500);
+pub const PROBE_BUDGET: Duration = Duration::from_millis(4500);
+const HTTP_HEADER_LIMIT: usize = 16 * 1024;
+#[cfg(windows)]
+const BROWSER_HEADER_LIMIT: usize = 64 * 1024;
 
 /// The same certificate/HTTP probe is used by the resolver and the CONNECT proxy.
 /// The socket is consumed: the real client always receives a fresh, unmodified tunnel.
@@ -20,11 +22,116 @@ fn probe_with_connector(
     deadline: Instant,
     connector: &TlsConnector,
 ) -> Result<u16, String> {
+    let header = probe_response(
+        stream,
+        host,
+        "HEAD /",
+        deadline,
+        connector,
+        HTTP_HEADER_LIMIT,
+    )?;
+    let status = parse_http_status(&header)?;
+    if status < 500 {
+        Ok(status)
+    } else {
+        Err(format!("HTTP {status}"))
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn probe_browser_connected(
+    stream: TcpStream,
+    host: &str,
+    path: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    let connector = TlsConnector::new().map_err(|e| e.to_string())?;
+    let header = probe_response(
+        stream,
+        host,
+        &format!("GET {path}"),
+        deadline,
+        &connector,
+        BROWSER_HEADER_LIMIT,
+    )?;
+    let status = parse_http_status(&header)?;
+    if !(200..400).contains(&status) {
+        return Err(format!("Страница отвечает HTTP {status}"));
+    }
+    if (300..400).contains(&status)
+        && String::from_utf8_lossy(&header).lines().any(|line| {
+            line.split_once(':').is_some_and(|(field, value)| {
+                field.eq_ignore_ascii_case("location")
+                    && value.split('?').next().is_some_and(|path| {
+                        path.contains("/sorry") || path.contains("/available-regions")
+                    })
+            })
+        })
+    {
+        return Err("Страница перенаправила на проверку доступа".into());
+    }
+    Ok(())
+}
+
+/// A blocking socket whose every read and write waits at most until the
+/// shared deadline. Unlike polling a non-blocking socket every 2 ms, the
+/// thread sleeps in the kernel until data arrives or the time is up.
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl DeadlineStream {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            // Reported like an expired socket timeout; callers check the deadline.
+            .ok_or_else(|| std::io::ErrorKind::WouldBlock.into())
+    }
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.remaining()?;
+        self.stream.set_read_timeout(Some(left))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let left = self.remaining()?;
+        self.stream.set_write_timeout(Some(left))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// A socket timeout surfaces as WouldBlock on Unix and TimedOut on Windows.
+fn timed_out(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+fn probe_response(
+    stream: TcpStream,
+    host: &str,
+    method_and_path: &str,
+    deadline: Instant,
+    connector: &TlsConnector,
+    header_limit: usize,
+) -> Result<Vec<u8>, String> {
     if Instant::now() >= deadline {
         return Err("TLS: общий срок проверки истёк".into());
     }
-    stream.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let mut handshake = connector.connect(host, stream);
+    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+    let mut handshake = connector.connect(host, DeadlineStream { stream, deadline });
     let mut tls = loop {
         if Instant::now() >= deadline {
             return Err("TLS: общий срок проверки истёк".into());
@@ -32,15 +139,17 @@ fn probe_with_connector(
         match handshake {
             Ok(tls) => break tls,
             Err(native_tls::HandshakeError::Failure(e)) => {
-                return Err(format!("TLS/certificate: {e}"))
+                if Instant::now() >= deadline {
+                    return Err("TLS: общий срок проверки истёк".into());
+                }
+                return Err(format!("TLS/certificate: {e}"));
             }
-            Err(native_tls::HandshakeError::WouldBlock(mid)) => {
-                std::thread::sleep(Duration::from_millis(2));
-                handshake = mid.handshake();
-            }
+            // A read or write waited until its timeout; retry within the deadline.
+            Err(native_tls::HandshakeError::WouldBlock(mid)) => handshake = mid.handshake(),
         }
     };
-    let request = format!("HEAD / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("{method_and_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     let mut sent = 0;
     while sent < request.len() {
         if Instant::now() >= deadline {
@@ -49,39 +158,33 @@ fn probe_with_connector(
         match tls.write(&request.as_bytes()[sent..]) {
             Ok(0) => return Err("HTTP write: EOF".into()),
             Ok(n) => sent += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2))
-            }
+            Err(e) if timed_out(&e) => {}
             Err(e) => return Err(e.to_string()),
         }
     }
     // Incremental parsing also enforces the total deadline for a trickling peer.
     let mut header = Vec::new();
-    let mut byte = [0u8; 1];
-    while header.len() < 16 * 1024 {
+    let mut buffer = [0u8; 1024];
+    while header.len() < header_limit {
         if Instant::now() >= deadline {
             return Err("HTTP header: timeout".into());
         }
-        match tls.read(&mut byte) {
+        let remaining = (header_limit - header.len()).min(buffer.len());
+        match tls.read(&mut buffer[..remaining]) {
             Ok(0) => return Err("HTTP header: EOF".into()),
-            Ok(_) => {
-                header.push(byte[0]);
-                if header.ends_with(b"\r\n\r\n") {
-                    let status = read_http_status(&mut header.as_slice())?;
-                    return if status < 500 {
-                        Ok(status)
-                    } else {
-                        Err(format!("HTTP {status}"))
-                    };
+            Ok(bytes) => {
+                let start = header.len().saturating_sub(3);
+                header.extend_from_slice(&buffer[..bytes]);
+                if let Some(end) = memchr::memmem::find(&header[start..], b"\r\n\r\n") {
+                    header.truncate(start + end + 4);
+                    return Ok(header);
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(2))
-            }
+            Err(e) if timed_out(&e) => {}
             Err(e) => return Err(e.to_string()),
         }
     }
-    Err("HTTP header exceeds 16 KiB".into())
+    Err(format!("HTTP header exceeds {} KiB", header_limit / 1024))
 }
 
 pub fn probe_ip(addr: SocketAddr, host: &str) -> Result<u128, String> {
@@ -99,28 +202,6 @@ fn probe_address(addr: SocketAddr, host: &str, deadline: Instant) -> Result<u16,
     probe_connected(stream, host, deadline)
 }
 
-pub fn check_ip(addr: SocketAddr, host: &str, refresh: bool) -> Result<u128, String> {
-    let key = Key::ip(host, addr);
-    let state = route_health::store().snapshot()?;
-    let now = route_health::now_ms();
-    if state.region_blocked(&key, now) {
-        return Err("Маршрут отложен после регионального отказа".into());
-    }
-    if state.blocked(&key, now) {
-        return Err("Маршрут ожидает повторной проверки".into());
-    }
-    if !refresh {
-        match state.cached(&key, now) {
-            Some(true) => return Ok(state.latency(&key).unwrap_or(1) as u128),
-            Some(false) => return Err("Маршрут ожидает повторной проверки".into()),
-            None => {}
-        }
-    }
-    let result = probe_ip(addr, host);
-    route_health::record(&key, result.as_ref().map(|ms| *ms).map_err(|_| ()))?;
-    result
-}
-
 #[derive(Debug, Default)]
 pub struct ConnReport {
     pub host: String,
@@ -133,56 +214,22 @@ pub struct ConnReport {
     pub error: Option<String>,
 }
 
-/// Complete TLS handshake with the OS trust store and hostname verification.
-pub fn connect_tls(
-    addr: SocketAddr,
-    host: &str,
-    budget: Duration,
-) -> Result<TlsStream<TcpStream>, String> {
-    let start = Instant::now();
-    let stream = TcpStream::connect_timeout(&addr, budget).map_err(|e| format!("TCP: {e}"))?;
-    let left = budget
-        .checked_sub(start.elapsed())
-        .filter(|d| !d.is_zero())
-        .ok_or("TLS: timeout")?;
-    stream
-        .set_read_timeout(Some(left))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(left))
-        .map_err(|e| e.to_string())?;
-    let connector = TlsConnector::new().map_err(|e| format!("TLS trust store: {e}"))?;
-    connector
-        .connect(host, stream)
-        .map_err(|e| format!("TLS/certificate: {e}"))
-}
-
-fn read_http_status(reader: &mut impl Read) -> Result<u16, String> {
-    let mut header = Vec::new();
-    let mut byte = [0u8; 1];
-    while header.len() < 16 * 1024 {
-        reader
-            .read_exact(&mut byte)
-            .map_err(|e| format!("HTTP header: {e}"))?;
-        header.push(byte[0]);
-        if header.ends_with(b"\r\n\r\n") {
-            let line = std::str::from_utf8(&header)
-                .map_err(|_| "HTTP: invalid header")?
-                .lines()
-                .next()
-                .unwrap_or("");
-            let mut fields = line.split_whitespace();
-            if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
-                return Err("HTTP: invalid status line".into());
-            }
-            return fields
-                .next()
-                .and_then(|s| s.parse::<u16>().ok())
-                .filter(|s| (200..=599).contains(s))
-                .ok_or_else(|| "HTTP: invalid final status".into());
-        }
+fn parse_http_status(header: &[u8]) -> Result<u16, String> {
+    let line = header
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let mut fields = std::str::from_utf8(line)
+        .map_err(|_| "HTTP: invalid status line")?
+        .split_whitespace();
+    if !matches!(fields.next(), Some("HTTP/1.0" | "HTTP/1.1")) {
+        return Err("HTTP: invalid status line".into());
     }
-    Err("HTTP: header exceeds 16 KiB".into())
+    fields
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|status| (200..=599).contains(status))
+        .ok_or_else(|| "HTTP: invalid final status".into())
 }
 
 const DIAGNOSTIC_BUDGET: Duration = Duration::from_secs(4);
@@ -618,33 +665,20 @@ pub(crate) mod tests {
         server.join().unwrap();
     }
     #[test]
-    fn tls_alert_and_plain_http_are_not_valid_handshakes() {
-        for reply in [
-            b"\x15\x03\x03\x00\x02\x02\x28".as_slice(),
-            b"HTTP/1.1 200 OK\r\n\r\n",
-        ] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let address = listener.local_addr().unwrap();
-            let reply = reply.to_vec();
-            let server = std::thread::spawn(move || {
-                let (mut s, _) = listener.accept().unwrap();
-                s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-                let _ = s.read(&mut [0u8; 4096]);
-                let _ = s.write_all(&reply);
-            });
-            assert!(connect_tls(address, "localhost", Duration::from_secs(1)).is_err());
-            server.join().unwrap();
-        }
-    }
-    #[test]
-    fn http_status_is_distinct_from_authorization_and_requires_complete_header() {
+    fn http_status_is_distinct_from_authorization_and_rejects_invalid_lines() {
         for status in [200, 401, 403, 404, 429, 503] {
             assert_eq!(
-                read_http_status(&mut format!("HTTP/1.1 {status} test\r\nX: y\r\n\r\n").as_bytes())
+                parse_http_status(format!("HTTP/1.1 {status} test\r\nX: y\r\n\r\n").as_bytes())
                     .unwrap(),
                 status
             );
         }
-        assert!(read_http_status(&mut b"HTTP/1.1 200 OK\r\n".as_slice()).is_err());
+        for header in [
+            "HTTP/2 200 OK\r\n\r\n",
+            "HTTP/1.1 099 x\r\n\r\n",
+            "garbage\r\n\r\n",
+        ] {
+            assert!(parse_http_status(header.as_bytes()).is_err(), "{header}");
+        }
     }
 }

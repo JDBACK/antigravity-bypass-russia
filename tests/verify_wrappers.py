@@ -115,6 +115,19 @@ with tempfile.TemporaryDirectory(prefix="ag wrapper ") as temporary:
                           "-File", str(cli_wrapper), "--restore", str(not_go_cli)])
             assert result.returncode == 19, (shell_name, result.returncode, result.stdout, result.stderr)
             assert "stale engine" in result.stdout, result.stdout
+            # --all forwards patch-files / restore-files without a single CLI path.
+            result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(cli_wrapper), "--all"])
+            assert result.returncode == 19, (shell_name, result.returncode, result.stdout, result.stderr)
+            assert "stale engine" in result.stdout, result.stdout
+            result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(cli_wrapper), "--all", "--restore"])
+            assert result.returncode == 19, (shell_name, result.returncode, result.stdout, result.stderr)
+            assert "stale engine" in result.stdout, result.stdout
+            result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(cli_wrapper), "--all", str(not_go_cli)])
+            assert result.returncode == 2, (shell_name, result.returncode, result.stdout, result.stderr)
+            assert "FullyQualifiedErrorId" not in result.stderr, result.stderr
             # PATH discovery: the Go-marked PE resolves (non-Go sibling is skipped).
             old_path = os.environ["PATH"]
             os.environ["PATH"] = str(fakebin) + os.pathsep + old_path
@@ -383,6 +396,25 @@ exit 1
             assert res.returncode == 11, (res.returncode, res.stdout, res.stderr)
             assert res.stdout.splitlines() == ["patch-files", str(real_cli.resolve())], res.stdout
             assert cli_build_count.read_text().strip() == "2"
+
+            # 5) --all patches or restores every discovered target without a path argument.
+            res = subprocess.run(
+                [bash, str(cli_scripts / "patch_cli.sh"), "--all"],
+                env=cli_env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            assert res.returncode == 11, (res.returncode, res.stdout, res.stderr)
+            assert res.stdout.splitlines() == ["patch-files"], res.stdout
+            res = subprocess.run(
+                [bash, str(cli_scripts / "patch_cli.sh"), "--all", "--restore"],
+                env=cli_env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            assert res.returncode == 11, (res.returncode, res.stdout, res.stderr)
+            assert res.stdout.splitlines() == ["restore-files"], res.stdout
+            res = subprocess.run(
+                [bash, str(cli_scripts / "patch_cli.sh"), "--all", str(explicit_link)],
+                env=cli_env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            assert res.returncode == 2, (res.returncode, res.stdout, res.stderr)
             print("PASS: unified patch_cli.sh and patch_cli_linux.sh wrapper checks")
     else:
         print("SKIP: Bash not installed")

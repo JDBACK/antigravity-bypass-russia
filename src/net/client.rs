@@ -398,6 +398,236 @@ pub fn query_raw_to(
     }
 }
 
+/// Sends one query to several DNS servers from a single socket and waits for
+/// matching replies from those servers only, instead of one socket and thread
+/// per server. A reply for which `enough` is false is kept as a fallback while
+/// the others still have time to answer.
+pub fn query_servers(
+    packet: &[u8],
+    servers: &[std::net::Ipv4Addr],
+    if_index: u32,
+    timeout: Duration,
+    accept: impl Fn(&[u8]) -> bool,
+    enough: impl Fn(&[u8]) -> bool,
+) -> Option<(Vec<u8>, std::net::Ipv4Addr)> {
+    let targets: Vec<_> = servers
+        .iter()
+        .map(|server| SocketAddrV4::new(*server, 53))
+        .collect();
+    query_targets(packet, &targets, if_index, timeout, accept, enough)
+        .map(|(reply, target)| (reply, *target.ip()))
+}
+
+fn query_targets(
+    packet: &[u8],
+    targets: &[SocketAddrV4],
+    if_index: u32,
+    timeout: Duration,
+    accept: impl Fn(&[u8]) -> bool,
+    enough: impl Fn(&[u8]) -> bool,
+) -> Option<(Vec<u8>, SocketAddrV4)> {
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    if if_index > 0 {
+        bind_socket_to_interface(&sock, if_index).ok()?;
+    }
+    let _ = sock.set_write_timeout(Some(timeout));
+    // A server listed twice answers once; counting it twice would wait out
+    // the whole timeout for a reply that never comes.
+    let mut unique: Vec<SocketAddrV4> = Vec::with_capacity(targets.len());
+    for target in targets {
+        if !unique.contains(target) {
+            unique.push(*target);
+        }
+    }
+    let targets = unique.as_slice();
+    let mut pending = 0;
+    for target in targets {
+        // An unreachable server must not prevent asking the others.
+        if sock.send_to(packet, target).is_ok() {
+            pending += 1;
+        }
+    }
+    let deadline = Instant::now() + timeout;
+    let mut fallback = None;
+    let mut answered = Vec::new();
+    let mut buf = [0u8; 1500];
+    while answered.len() < pending {
+        let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            break;
+        };
+        if sock.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        let (n, from) = match sock.recv_from(&mut buf) {
+            Ok(received) => received,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break
+            }
+            // Windows reports an ICMP error (port unreachable, TTL expired)
+            // from one server on the shared socket. Each target got exactly
+            // one datagram, so the error stands for one server that will not
+            // answer: stop waiting for it, keep waiting for the others.
+            Err(_) => {
+                pending = pending.saturating_sub(1);
+                continue;
+            }
+        };
+        let std::net::SocketAddr::V4(from) = from else {
+            continue;
+        };
+        if !targets.contains(&from)
+            || answered.contains(&from)
+            || !response_matches(packet, &buf[..n])
+        {
+            continue;
+        }
+        answered.push(from);
+        let reply = &buf[..n];
+        if !accept(reply) {
+            continue;
+        }
+        if enough(reply) {
+            return Some((reply.to_vec(), from));
+        }
+        fallback = Some((reply.to_vec(), from));
+    }
+    fallback
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+
+    fn server(addresses: Vec<Ipv4Addr>, delay: u64) -> (SocketAddrV4, std::thread::JoinHandle<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(address) = socket.local_addr().unwrap() else {
+            panic!()
+        };
+        let worker = std::thread::spawn(move || {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = [0u8; 512];
+            let (n, peer) = socket.recv_from(&mut bytes).unwrap();
+            std::thread::sleep(Duration::from_millis(delay));
+            let reply = if addresses.is_empty() {
+                nodata_response(&bytes[..n])
+            } else {
+                address_response(&bytes[..n], &addresses).unwrap()
+            };
+            socket.send_to(&reply, peer).unwrap();
+        });
+        (address, worker)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_unreachable_server_does_not_hold_up_the_others() {
+        // A loopback port with no listener answers with ICMP port unreachable,
+        // which Windows reports on the shared socket as ConnectionReset.
+        let closed = {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let std::net::SocketAddr::V4(address) = socket.local_addr().unwrap() else {
+                panic!()
+            };
+            address
+        };
+        let query = build_query("fan-out.example", 4343);
+        let (empty, worker) = server(vec![], 0);
+        let started = Instant::now();
+        let (_, from) = query_targets(
+            &query,
+            &[closed, empty],
+            0,
+            Duration::from_secs(1),
+            is_successful_response,
+            |reply| !answer_addrs(reply).is_empty(),
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(from, empty);
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let started = Instant::now();
+        assert!(query_targets(
+            &query,
+            &[closed],
+            0,
+            Duration::from_secs(1),
+            is_successful_response,
+            |_| true,
+        )
+        .is_none());
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn one_socket_keeps_an_empty_reply_until_a_useful_one_arrives() {
+        let query = build_query("fan-out.example", 4242);
+        let (empty, first) = server(vec![], 0);
+        let (useful, second) = server(vec![Ipv4Addr::new(203, 0, 113, 7)], 50);
+        let has_address = |reply: &[u8]| !answer_addrs(reply).is_empty();
+        let (reply, from) = query_targets(
+            &query,
+            &[empty, useful],
+            0,
+            Duration::from_secs(1),
+            is_successful_response,
+            has_address,
+        )
+        .unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert_eq!(from, useful);
+        assert_eq!(
+            answer_addrs(&reply),
+            vec![std::net::IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))]
+        );
+
+        // With only the empty server, its reply is returned once it is the last.
+        let (empty, worker) = server(vec![], 0);
+        let started = Instant::now();
+        let (reply, from) = query_targets(
+            &query,
+            &[empty],
+            0,
+            Duration::from_secs(1),
+            is_successful_response,
+            has_address,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(from, empty);
+        assert!(answer_addrs(&reply).is_empty());
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // The same server configured twice is asked once and does not cost
+        // the full timeout.
+        let (empty, worker) = server(vec![], 0);
+        let started = Instant::now();
+        let (_, from) = query_targets(
+            &query,
+            &[empty, empty],
+            0,
+            Duration::from_secs(1),
+            is_successful_response,
+            has_address,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(from, empty);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+}
+
 #[cfg(test)]
 mod readiness_transport_tests {
     use super::*;

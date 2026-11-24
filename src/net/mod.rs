@@ -13,6 +13,7 @@ pub mod nrpt;
 pub mod provider;
 pub mod rank;
 pub mod relay;
+mod relay_update;
 pub mod resolver_pool;
 pub mod resolvers;
 pub mod route_health;
@@ -20,40 +21,47 @@ pub mod routes;
 pub mod socket;
 #[cfg(any(target_os = "macos", test))]
 pub mod split_dns;
+#[cfg(windows)]
+mod web_rules;
+#[cfg(windows)]
+pub mod windows_connect;
 
 pub use relay::{detach_console, log_fatal, run as run_dns_relay};
 
 #[cfg(any(target_os = "macos", test))]
 use provider::nrpt_domains;
+#[cfg(any(windows, target_os = "macos", test))]
+use provider::NRPT_STUDIO;
 #[cfg(windows)]
 use provider::NRPT_TAG;
-use provider::{NRPT_AGENT, NRPT_STUDIO, SUBSTITUTION_CANARIES};
+use provider::{NRPT_AGENT, PRIMARY_CLOUD_CODE, SUBSTITUTION_CANARIES};
 use relay::{LISTEN_IP, LISTEN_PORT};
 #[cfg(windows)]
-use routes::{add_static_routes, remove_static_routes};
+use routes::remove_static_routes;
+use routes::RoutePolicy;
 use std::thread;
 use std::time::Duration;
 
-fn assemble_nameservers(via_relay: bool, substituters: &[&str]) -> String {
-    let mut servers: Vec<String> = Vec::new();
-    if via_relay {
-        servers.push(LISTEN_IP.to_string());
-    }
-    if substituters.is_empty() {
-        for s in resolvers::fallback_v4() {
-            servers.push(s.to_string());
-        }
+#[cfg(any(windows, target_os = "macos", test))]
+fn assemble_nameservers(via_relay: bool, substituters: &[&str], fallback: &[&str]) -> String {
+    let servers = if substituters.is_empty() {
+        fallback
     } else {
-        for s in substituters {
-            servers.push((*s).to_string());
-        }
-    }
-    servers.join(";")
+        substituters
+    };
+    via_relay
+        .then_some(LISTEN_IP)
+        .into_iter()
+        .chain(servers.iter().copied())
+        .collect::<Vec<_>>()
+        .join(";")
 }
 
+#[cfg(any(windows, target_os = "macos", test))]
 fn assemble_dns_rules(
     agent_rules: &[(String, Vec<&str>)],
     studio_servers: &[&str],
+    udp_fallback: &[&str],
     via_relay: bool,
     use_split_dns: bool,
 ) -> Vec<(String, String)> {
@@ -68,12 +76,20 @@ fn assemble_dns_rules(
     // also covers that domain; macOS maps exact and suffix names to one file.
     let mut rules: Vec<_> = agent_rules
         .iter()
-        .map(|(name, servers)| (namespace(name), assemble_nameservers(via_relay, servers)))
+        .map(|(name, servers)| {
+            (
+                namespace(name),
+                assemble_nameservers(via_relay, servers, udp_fallback),
+            )
+        })
         .collect();
     for name in NRPT_STUDIO {
         let name = namespace(name);
         if !rules.iter().any(|(existing, _)| *existing == name) {
-            rules.push((name, assemble_nameservers(via_relay, studio_servers)));
+            rules.push((
+                name,
+                assemble_nameservers(via_relay, studio_servers, udp_fallback),
+            ));
         }
     }
     rules
@@ -101,17 +117,68 @@ mod tests {
 
     #[test]
     fn classic_mode_keeps_external_dns_fallbacks_alongside_the_relay() {
+        use super::*;
+        let config = config::Config {
+            extra_udp: vec![config::UdpProvider {
+                name: "my-udp".into(),
+                addresses: vec!["192.0.2.53".parse().unwrap(), "192.0.2.54".parse().unwrap()],
+            }],
+            ..config::Config::default()
+        };
+        let pool = resolver_pool::from_config(&config).unwrap();
+        let fallback = resolvers::configured_udp_v4(&pool);
+        let servers: Vec<_> = fallback.iter().map(String::as_str).collect();
         assert_eq!(
-            super::assemble_nameservers(true, &["1.2.3.4"]),
-            format!("{};1.2.3.4", super::LISTEN_IP)
+            assemble_nameservers(true, &["192.0.2.80"], &servers),
+            format!("{LISTEN_IP};192.0.2.80")
         );
-        assert_eq!(super::assemble_nameservers(false, &["1.2.3.4"]), "1.2.3.4");
-        assert_eq!(super::assemble_nameservers(false, &[]), "45.155.204.190");
+        assert_eq!(
+            assemble_nameservers(false, &["192.0.2.80"], &servers),
+            "192.0.2.80"
+        );
+        assert_eq!(
+            assemble_nameservers(false, &[], &servers),
+            "192.0.2.53;192.0.2.54"
+        );
+        assert_eq!(
+            assemble_nameservers(true, &[], &servers),
+            format!("{LISTEN_IP};192.0.2.53;192.0.2.54")
+        );
+    }
+
+    #[test]
+    fn default_doh_rules_use_only_the_relay_or_require_agent_hosts_on_windows() {
+        use super::*;
+        let pool = resolver_pool::from_config(&config::Config::default()).unwrap();
+        let fallback = resolvers::configured_udp_v4(&pool);
+        assert!(fallback.is_empty());
+        let agent_rules: Vec<_> = NRPT_AGENT
+            .iter()
+            .map(|host| (host.to_string(), vec![]))
+            .collect();
+        let inventory = nrpt::NrptInventory::default();
+
+        let desired = assemble_dns_rules(&agent_rules, &[], &[], true, false);
+        let plan = inventory.plan(&desired);
+        assert_eq!(plan.rules, desired);
+        assert!(plan.rules.iter().all(|(_, servers)| servers == LISTEN_IP));
+        assert!(compatibility_coverage(&plan, &[], false)
+            .agent_hosts
+            .is_empty());
+
+        let desired = assemble_dns_rules(&agent_rules, &[], &[], false, false);
+        let plan = inventory.plan(&desired);
+        assert!(plan.rules.is_empty());
+        assert_eq!(
+            compatibility_coverage(&plan, &[], false).agent_hosts,
+            NRPT_AGENT
+        );
     }
 
     #[test]
     fn macos_rules_keep_agent_dns_when_studio_results_differ() {
         use super::*;
+        let fallback = ["192.0.2.53"];
         let cases: &[(&[&str], &[&str])] = &[
             (&["45.155.204.190"], &["111.88.96.50", "45.155.204.190"]),
             (
@@ -131,7 +198,7 @@ mod tests {
                 .iter()
                 .map(|name| (name.to_string(), agent_servers.to_vec()))
                 .collect();
-            let rules = assemble_dns_rules(&agent_rules, studio_servers, false, true);
+            let rules = assemble_dns_rules(&agent_rules, studio_servers, &fallback, false, true);
             assert_eq!(rules.len(), expected_domains.len());
             assert_eq!(
                 rules
@@ -143,7 +210,7 @@ mod tests {
             for host in NRPT_AGENT {
                 assert_eq!(
                     rules.iter().find(|(name, _)| name == host).unwrap().1,
-                    assemble_nameservers(false, agent_servers)
+                    assemble_nameservers(false, agent_servers, &fallback)
                 );
             }
             assert_eq!(
@@ -152,7 +219,7 @@ mod tests {
                     .find(|(name, _)| name == "aistudio.google.com")
                     .unwrap()
                     .1,
-                assemble_nameservers(false, studio_servers)
+                assemble_nameservers(false, studio_servers, &fallback)
             );
             let dir = tempfile::tempdir().unwrap();
             let resolver_dir = dir.path().join("resolver");
@@ -168,7 +235,7 @@ mod tests {
                 .collect();
             assert_eq!(
                 servers.join(";"),
-                assemble_nameservers(false, agent_servers)
+                assemble_nameservers(false, agent_servers, &fallback)
             );
             assert!(split_dns::remove(&resolver_dir, &nrpt_domains()).is_empty());
             for domain in &expected_domains {
@@ -187,7 +254,7 @@ mod tests {
             .map(|name| (name.to_string(), agent_servers.clone()))
             .collect();
         for via_relay in [false, true] {
-            let rules = assemble_dns_rules(&agent_rules, &studio_servers, via_relay, false);
+            let rules = assemble_dns_rules(&agent_rules, &studio_servers, &[], via_relay, false);
             let expected_names: std::collections::BTreeSet<_> =
                 nrpt_domains().into_iter().collect();
             assert_eq!(rules.len(), expected_names.len());
@@ -201,7 +268,7 @@ mod tests {
             for host in NRPT_AGENT {
                 assert_eq!(
                     rules.iter().find(|(name, _)| name == host).unwrap().1,
-                    assemble_nameservers(via_relay, &agent_servers)
+                    assemble_nameservers(via_relay, &agent_servers, &[])
                 );
             }
             assert_eq!(
@@ -210,7 +277,7 @@ mod tests {
                     .find(|(name, _)| name == ".generativelanguage.googleapis.com")
                     .unwrap()
                     .1,
-                assemble_nameservers(via_relay, &studio_servers)
+                assemble_nameservers(via_relay, &studio_servers, &[])
             );
         }
     }
@@ -246,8 +313,9 @@ mod tests {
             ),
         ];
         let plan = inventory.plan(&desired);
-        let coverage = compatibility_coverage(&plan, &[]);
+        let coverage = compatibility_coverage(&plan, &[], false);
         assert_eq!(coverage.agent_hosts, ["daily-cloudcode-pa.googleapis.com"]);
+        assert!(!coverage.browser_rules_effective);
         assert!(coverage
             .notes
             .iter()
@@ -280,13 +348,21 @@ mod tests {
                 namespace: "CLOUDCODE-PA.GOOGLEAPIS.COM.".into(),
                 reason: "Windows uses another DNS".into(),
             }],
+            false,
         );
         assert_eq!(coverage.agent_hosts, ["cloudcode-pa.googleapis.com"]);
         inventory.policy_present = true;
         assert_eq!(
-            compatibility_coverage(&inventory.plan(&desired), &[]).agent_hosts,
+            compatibility_coverage(&inventory.plan(&desired), &[], false).agent_hosts,
             NRPT_AGENT
         );
+        let daily_only = compatibility_coverage(&inventory.plan(&desired), &[], true);
+        let required: Vec<_> = NRPT_AGENT
+            .iter()
+            .copied()
+            .filter(|host| *host != PRIMARY_CLOUD_CODE)
+            .collect();
+        assert_eq!(daily_only.agent_hosts, required);
     }
 
     #[test]
@@ -339,6 +415,8 @@ pub(super) fn flush_dns_cache() -> Result<(), String> {
     ];
     #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let commands: &[(&str, &[&str])] = &[];
+    // Linux returns after the first working command and collects nothing.
+    #[cfg_attr(target_os = "linux", allow(unused_mut))]
     let mut errors: Vec<String> = Vec::new();
     for (program, args) in commands {
         match crate::system::command::output(program, *args) {
@@ -374,12 +452,53 @@ pub struct NetworkSetup {
     pub message: String,
     pub local_relay_running: bool,
     pub hosts_fallback: bool,
-    pub compatibility_notes: Vec<String>,
+    pub system_routes: bool,
+    pub browser_dns_confirmed: bool,
+    /// The regular Cloud Code endpoint failed verification; clients must use daily.
+    pub primary_skipped: bool,
+}
+
+pub enum SetupProgress<'a> {
+    /// A new user-visible step begins; the previous one succeeded.
+    Stage(SetupStage),
+    Working(&'a str),
+    Detail(&'a str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupStage {
+    /// Finding and checking the Google servers.
+    Connection,
+    /// Starting and checking the background DNS service.
+    Service,
+    /// Writing the system settings.
+    Saving,
+}
+
+/// Whether the web versions of Gemini and AI Studio go through the bypass
+/// now, and when the service last switched them after a VPN change.
+pub fn web_rules_status() -> Option<(bool, Option<u64>)> {
+    #[cfg(windows)]
+    return web_rules::status();
+    #[cfg(not(windows))]
+    None
+}
+
+/// A plain-language name for a Google server, for on-screen text.
+pub fn server_label(host: &str) -> &'static str {
+    match host.trim_start_matches('.') {
+        provider::PRIMARY_CLOUD_CODE => "основной сервер Antigravity",
+        provider::DAILY_CLOUD_CODE => "резервный сервер Antigravity",
+        "aicode.googleapis.com" => "сервер проверки доступа",
+        "generativelanguage.googleapis.com" => "сервер Gemini",
+        _ => "сервер Google",
+    }
 }
 
 #[cfg(any(windows, test))]
 struct CompatibilityCoverage {
     agent_hosts: Vec<String>,
+    browser_rules_effective: bool,
     notes: Vec<String>,
 }
 
@@ -387,6 +506,7 @@ struct CompatibilityCoverage {
 fn compatibility_coverage(
     plan: &nrpt::CompatibilityPlan,
     issues: &[nrpt::EffectiveIssue],
+    skip_primary: bool,
 ) -> CompatibilityCoverage {
     let normalize = |name: &str| name.trim().trim_end_matches('.').to_ascii_lowercase();
     let unavailable: std::collections::BTreeSet<_> = plan
@@ -399,6 +519,7 @@ fn compatibility_coverage(
     // skipped suffix must not invalidate an effective exact Agent rule.
     let agent_hosts: Vec<_> = NRPT_AGENT
         .iter()
+        .filter(|host| !skip_primary || **host != PRIMARY_CLOUD_CODE)
         .filter(|host| unavailable.contains(**host))
         .map(|host| (*host).to_string())
         .collect();
@@ -445,7 +566,11 @@ fn compatibility_coverage(
     for issue in issues {
         notes.push(format!("DNS {}: {}", issue.namespace, issue.reason));
     }
-    CompatibilityCoverage { agent_hosts, notes }
+    CompatibilityCoverage {
+        agent_hosts,
+        browser_rules_effective: optional.is_empty(),
+        notes,
+    }
 }
 
 #[cfg(any(windows, test))]
@@ -473,12 +598,27 @@ impl Drop for ConfigurationLock {
 }
 
 pub(super) fn configuration_lock() -> Result<ConfigurationLock, String> {
-    let dir = relay::log_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    lock_configuration_file(&dir.join("network-update.lock"))
+    try_configuration_lock()?.ok_or_else(configuration_busy)
 }
 
+fn try_configuration_lock() -> Result<Option<ConfigurationLock>, String> {
+    let dir = relay::log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    try_lock_configuration_file(&dir.join("network-update.lock"))
+}
+
+fn configuration_busy() -> String {
+    "Настройки сети уже обновляются другим процессом. Повторите после завершения обновления.".into()
+}
+
+#[cfg(test)]
 fn lock_configuration_file(path: &std::path::Path) -> Result<ConfigurationLock, String> {
+    try_lock_configuration_file(path)?.ok_or_else(configuration_busy)
+}
+
+fn try_lock_configuration_file(
+    path: &std::path::Path,
+) -> Result<Option<ConfigurationLock>, String> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -486,102 +626,214 @@ fn lock_configuration_file(path: &std::path::Path) -> Result<ConfigurationLock, 
         .write(true)
         .open(path)
         .map_err(|e| format!("Блокировка настройки сети: {e}"))?;
-    file.try_lock().map_err(|e| match e {
-        std::fs::TryLockError::WouldBlock =>
-            "Настройки сети уже обновляются другим процессом. Повторите после завершения обновления.".to_string(),
-        other => format!("Блокировка настройки сети: {other}"),
-    })?;
-    Ok(ConfigurationLock(file))
+    match file.try_lock() {
+        Ok(()) => Ok(Some(ConfigurationLock(file))),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(error) => Err(format!("Блокировка настройки сети: {error}")),
+    }
 }
 
-pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
-    fn step(msg: &str) {
-        println!("  \x1b[90m… {}\x1b[0m", msg);
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
+pub fn apply_dns_rules(
+    progress: &mut dyn FnMut(SetupProgress<'_>),
+) -> Result<NetworkSetup, String> {
+    #[cfg(windows)]
+    let policy = RoutePolicy::System;
+    #[cfg(not(windows))]
+    let policy = RoutePolicy::Physical;
+    apply_dns_rules_with(policy, progress)
+}
 
+/// Each probe waits on the network for up to the resolver budget. Run every
+/// distinct host at once instead of one after another; a host shared by the
+/// Agent rules and the canaries is probed once.
+fn substitutions_by_host<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+    probe: impl Fn(&str) -> Vec<String> + Sync,
+) -> std::collections::HashMap<String, Vec<String>> {
+    let mut hosts: Vec<&str> = Vec::new();
+    for name in names {
+        let host = name.trim_start_matches('.');
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    let probe = &probe;
+    thread::scope(|scope| {
+        let probes: Vec<_> = hosts
+            .iter()
+            .map(|host| (*host, scope.spawn(move || probe(host))))
+            .collect();
+        probes
+            .into_iter()
+            .map(|(host, probe)| (host.to_string(), probe.join().unwrap_or_default()))
+            .collect()
+    })
+}
+
+fn apply_dns_rules_with(
+    policy: RoutePolicy,
+    progress: &mut dyn FnMut(SetupProgress<'_>),
+) -> Result<NetworkSetup, String> {
+    use SetupProgress::{Detail, Stage, Working};
+    progress(Stage(SetupStage::Connection));
+    progress(Working("проверяем настройки сети"));
     preflight()?;
     let _configuration = configuration_lock()?;
-    config::prepare_service()?;
-    step("Подготавливаем подключение");
     // Reconfigure owned rules in place. Removing the working service/hosts/DNS
     // before discovery left users disconnected whenever all probes failed.
 
-    step("Проверяем настройки сети");
     // Read before changing routes/service; unreadable rules are not evidence
     // that DNS is safe to overwrite. Re-read before applying the final plan.
     #[cfg(windows)]
     let initial_inventory = nrpt::inventory()?;
-    #[cfg(windows)]
+    let previously_configured = nrpt::get_nrpt_status_info().0 > 0;
+    let pool = resolver_pool::load()?;
+    let udp_ips = resolvers::configured_udp_v4(&pool);
     let mut compatibility_notes = Vec::new();
-    #[cfg(not(windows))]
-    let compatibility_notes = Vec::new();
     #[cfg(windows)]
     let hosts_fallback;
     #[cfg(not(windows))]
     let hosts_fallback = false;
 
-    step("Определяем подключение к интернету");
-    let egress = crate::net::egress::detect();
+    progress(Working("определяем подключение к интернету"));
+    let egress = match policy {
+        RoutePolicy::Physical => crate::net::egress::detect(),
+        #[cfg(windows)]
+        RoutePolicy::System => None,
+    };
     let if_index = egress.as_ref().map(|e| e.if_index).unwrap_or(0);
     #[cfg(windows)]
-    if if_index == 0 || egress.as_ref().is_none_or(|e| e.gateway.is_none()) {
+    if policy == RoutePolicy::Physical
+        && (if_index == 0 || egress.as_ref().is_none_or(|e| e.gateway.is_none()))
+    {
         return Err("Не найден физический выход в интернет; проверка через VPN отменена".into());
     }
-    if if_index > 0 {
-        crate::net::relay::save_if_index(if_index);
-    }
-    #[cfg(target_os = "linux")]
-    linux_dns::prepare(if_index)?;
 
-    crate::net::relay::clear_custom_mode();
-    let ips: Vec<String> = resolvers::all_provider_v4()
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-    crate::net::relay::save_upstream_config(&ips);
+    progress(Detail("Подбор маршрута · проверяем DNS и TLS/HTTP"));
+    progress(Working("готовим проверку"));
+    let mut update = None;
+    let staged = routes::with_probe_routes(policy, |prepare_routes| {
+        // DNS probes and the running relay use the same route policy.
+        prepare_routes(&[])?;
+        // Give freshly added physical routes time to apply. The system route
+        // policy changes no routes here, so it has nothing to wait for.
+        #[cfg(windows)]
+        if policy == RoutePolicy::Physical {
+            thread::sleep(Duration::from_millis(400));
+        }
+        let discovery = rank::discover_agent(if_index, policy, prepare_routes, progress)?;
+        // Every caller switches client endpoints to daily right after this
+        // setup, so the regular endpoint is optional wherever that switch
+        // covers all discovered clients.
+        let skip_primary = rank::check_agent_routes(
+            &discovery.ranked,
+            &discovery.failures,
+            crate::core::endpoint::primary_optional(),
+        )?;
+        let ranked = discovery.ranked;
 
-    // Routes first. If VPN is the default route, substitution probes otherwise
-    // leak into the tunnel and SmartDNS returns genuine Google.
-    #[cfg(target_os = "windows")]
-    {
-        step("Подготавливаем DNS");
-        add_static_routes()?;
-        thread::sleep(Duration::from_millis(400));
+        let update = update.insert(relay_update::RelayUpdate::capture()?);
+        config::prepare_service()?;
+        if if_index > 0 || policy != RoutePolicy::Physical {
+            relay::save_if_index(if_index)?;
+        }
+        #[cfg(target_os = "linux")]
+        linux_dns::prepare(if_index)?;
+        relay::save_route_policy(policy)?;
+        relay::save_upstream_config(&udp_ips)?;
+
+        progress(Stage(SetupStage::Service));
+        progress(Working("запускаем фоновую службу"));
+        let mut browser_missing = Vec::new();
+        let startup = update.start().and_then(|()| {
+            if !wait_for_ready(Duration::from_secs(4), relay_ready) {
+                return Err("DNS-релей не подтвердил готовность за 4с".into());
+            }
+            let answers = relay_answers(skip_primary, relay_returns_address);
+            browser_missing = answers.browser_missing;
+            if !answers.agent_missing.is_empty() {
+                #[cfg(windows)]
+                if matches!(relay::local_dns_available(), Ok(false)) {
+                    return Err("Локальный UDP-порт 53 недоступен даже для тестового пакета".into());
+                }
+                return Err(format!(
+                    "Релей не вернул пригодный A-ответ для Agent ({})",
+                    answers.agent_missing.join(", ")
+                ));
+            }
+            if previously_configured && !browser_missing.is_empty() {
+                return Err(format!(
+                    "Релей не вернул пригодный A-ответ для браузерных доменов ({})",
+                    browser_missing.join(", ")
+                ));
+            }
+            Ok(())
+        });
+        let fallback_supported =
+            cfg!(windows) || (cfg!(target_os = "macos") && !udp_ips.is_empty());
+        let relay_error =
+            relay_update::allow_relay_fallback(startup, previously_configured, fallback_supported)?;
+        config::keep_downgrade_compatible()?;
+        Ok((ranked, skip_primary, relay_error, browser_missing))
+    });
+    let (ranked, skip_primary, relay_error, browser_missing) =
+        relay_update::finish_staging(staged, || update.map_or(Ok(()), |update| update.rollback()))?;
+    if skip_primary {
+        compatibility_notes.push(format!(
+            "{PRIMARY_CLOUD_CODE}: недоступен из этой сети, клиенты переключаются на daily"
+        ));
     }
 
     let mut sub_notes = Vec::new();
-    let mut agent_rules: Vec<(String, Vec<String>)> = Vec::new();
+    let mut agent_rules: Vec<_> = NRPT_AGENT
+        .iter()
+        .map(|name| (name.to_string(), Vec::new()))
+        .collect();
     let mut studio_subs: Vec<String> = Vec::new();
-    step("Проверяем доступные серверы");
-    {
-        for name in NRPT_AGENT {
+    if !udp_ips.is_empty() {
+        progress(Working("проверяем запасные серверы адресов"));
+        let substitutions = substitutions_by_host(
+            agent_rules
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .chain(SUBSTITUTION_CANARIES.iter().copied()),
+            |host| resolvers::substituting_addrs(host, if_index),
+        );
+        for (name, subs) in &mut agent_rules {
             let host = name.trim_start_matches('.');
-            let subs = resolvers::substituting_addrs(host, if_index);
+            *subs = substitutions[host].clone();
             if subs.is_empty() {
-                sub_notes.push(format!("{host}: нет"));
-                agent_rules.push(((*name).to_string(), resolvers::fallback_v4()));
+                sub_notes.push(format!("{host}: подмена через прямой UDP не подтверждена"));
             } else {
                 sub_notes.push(format!("{host}: {}", subs.join(", ")));
-                agent_rules.push(((*name).to_string(), subs));
             }
         }
         for name in SUBSTITUTION_CANARIES {
             let host = name.trim_start_matches('.');
-            for s in resolvers::substituting_addrs(host, if_index) {
-                if !studio_subs.contains(&s) {
-                    studio_subs.push(s);
+            for s in &substitutions[host] {
+                if !studio_subs.contains(s) {
+                    studio_subs.push(s.clone());
                 }
             }
         }
         if studio_subs.is_empty() {
-            sub_notes
-                .push("Studio/Gemini: подмена не подтверждена, оставлены все резервные DNS".into());
+            sub_notes.push("Studio/Gemini: подмена через прямой UDP не подтверждена".into());
         } else {
             sub_notes.push(format!("Studio/Gemini: {}", studio_subs.join(", ")));
         }
     }
     let _ = (&agent_rules, &studio_subs);
+    // The background service rewrites these same rules when the VPN is
+    // turned on or off (see web_rules).
+    #[cfg(windows)]
+    let mut followed_rules = web_rules::SavedRules {
+        agent: agent_rules.clone(),
+        studio: studio_subs.clone(),
+        udp_fallback: udp_ips.clone(),
+        skip_primary,
+        via_relay: false,
+        switched_at_ms: None,
+    };
     #[cfg(not(target_os = "linux"))]
     let agent_rules: Vec<_> = agent_rules
         .iter()
@@ -594,54 +846,27 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
         .collect();
     #[cfg(not(target_os = "linux"))]
     let studio_subs: Vec<_> = studio_subs.iter().map(String::as_str).collect();
-    // Reject invalid or conflicting resolver plans before ranking writes hosts
-    // or setup changes the service. Applying later rechecks file ownership.
-    #[cfg(target_os = "macos")]
-    let _prepared = split_dns::prepare(
-        std::path::Path::new("/etc/resolver"),
-        &assemble_dns_rules(&agent_rules, &studio_subs, true, true),
-    )?;
-    step("Выбираем подходящее подключение");
-    let ranked = crate::net::rank::discover_agent(if_index)?;
+    #[cfg(not(target_os = "linux"))]
+    let udp_fallback: Vec<_> = udp_ips.iter().map(String::as_str).collect();
     for note in crate::net::rank::format_notes(&ranked) {
         sub_notes.push(note);
     }
-    let mut relay_ok = false;
-    let mut relay_note = String::new();
-    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-    {
-        step("Запускаем DNS-обход");
-        match crate::system::service::enable() {
-            Ok(()) => {
-                relay_ok = wait_for_ready(Duration::from_secs(4), relay_ready);
-                if !relay_ok {
-                    relay_note = "фоновый процесс не подтвердил готовность за 4с".into();
-                }
-            }
-            Err(e) => {
-                relay_note = format!("релей не установлен ({e}), используются прямые UDP DNS");
-            }
-        }
+    let relay_ok = relay_error.is_none();
+    let browser_dns_confirmed = relay_ok && browser_missing.is_empty();
+    let relay_note = relay_error.unwrap_or_default();
+    if !browser_missing.is_empty() {
+        compatibility_notes.push(format!(
+            "Gemini/AI Studio: релей не вернул пригодный A-ответ для {}",
+            browser_missing.join(", ")
+        ));
     }
-    // Readiness is local; separately verify that the DNS data path answers.
-    if relay_ok && !relay_answers() {
-        relay_ok = false;
-        relay_note =
-            "процесс запущен, но DNS-проверка не прошла; сохранены резервные адреса".into();
-    }
-    #[cfg(target_os = "linux")]
-    if !relay_ok {
-        return Err(format!("DNS Linux не переключён: {relay_note}"));
-    }
-    if !relay_ok && resolvers::fallback_v4().is_empty() {
-        #[cfg(not(windows))]
-        return Err("Включены только DoH-провайдеры, но локальный DNS не запустился".into());
+    if !relay_ok && udp_ips.is_empty() {
         #[cfg(windows)]
-        compatibility_notes.push(
-            "Локальный DNS не запустился; подключение Antigravity проверяется через hosts".into(),
-        );
+        compatibility_notes.push(format!(
+            "{relay_note}. Подключение Antigravity проверяется через hosts"
+        ));
     }
-    if !relay_ok && resolver_pool::load()?.iter().any(|p| p.kind() == "doh") {
+    if !relay_ok && pool.iter().any(|p| p.kind() == "doh") {
         sub_notes.push(
             "DoH доступен при подборе IP; для текущих DNS-запросов нужна работающая служба".into(),
         );
@@ -649,32 +874,45 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
     #[cfg(target_os = "macos")]
     let rules = split_dns::prepare(
         std::path::Path::new("/etc/resolver"),
-        &assemble_dns_rules(&agent_rules, &studio_subs, relay_ok, true),
+        &assemble_dns_rules(&agent_rules, &studio_subs, &udp_fallback, relay_ok, true),
     )?;
     #[cfg(windows)]
     let (inventory, plan) = {
-        let rules = assemble_dns_rules(&agent_rules, &studio_subs, relay_ok, false);
+        let rules = assemble_dns_rules(&agent_rules, &studio_subs, &udp_fallback, relay_ok, false);
         let inventory = nrpt::inventory()?;
         let plan = inventory.plan(&rules);
-        let coverage = compatibility_coverage(&plan, &[]);
+        let coverage = compatibility_coverage(&plan, &[], skip_primary);
         // Reject a known uncovered Agent before replacing its working pins or
         // removing an old owned NRPT rule during reconciliation.
         compatibility::require_agent_pins(&coverage.agent_hosts, &ranked)?;
         (inventory, plan)
     };
-    crate::net::rank::apply_ranked(&ranked)?;
+    progress(Stage(SetupStage::Saving));
+    crate::net::rank::apply_ranked(&ranked, skip_primary, policy)?;
 
     // Keep verified agent addresses installed by apply_ranked. A VPN enabled
     // later may intercept loopback DNS even while the relay remains healthy.
 
     #[cfg(target_os = "windows")]
-    {
-        step("Сохраняем настройки подключения");
+    let browser_dns_confirmed = {
+        progress(Working("записываем настройки Windows"));
         let plan = nrpt::apply_compatible_rules(&plan, NRPT_TAG, "Antigravity DNS")?;
+        followed_rules.via_relay = relay_ok;
+        if let Err(error) = web_rules::save(&followed_rules) {
+            // Setup itself succeeded; only the switch on VPN changes is lost.
+            relay::log_event(&format!("Правила для смены VPN не сохранены: {error}"));
+        }
         let latest_inventory = nrpt::inventory()?;
         // Foreign split-DNS often relies on system DoH policy. Hosts provides
         // the Agent fallback without changing those global settings.
-        if may_disable_system_doh(&[&initial_inventory, &inventory, &latest_inventory], &plan) {
+        if policy == RoutePolicy::System {
+            if let Err(error) = crate::net::doh::restore_system_doh() {
+                compatibility_notes.push(format!("Восстановление исходного DoH: {error}"));
+            }
+        } else if may_disable_system_doh(
+            &[&initial_inventory, &inventory, &latest_inventory],
+            &plan,
+        ) {
             crate::net::doh::disable_system_doh()?;
         } else {
             compatibility_notes
@@ -691,11 +929,11 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
                 })
                 .collect(),
         };
-        let coverage = compatibility_coverage(&plan, &issues);
+        let coverage = compatibility_coverage(&plan, &issues, skip_primary);
         hosts_fallback = !coverage.agent_hosts.is_empty();
         flush_dns_cache()?;
         if hosts_fallback {
-            step("Проверяем подключение Antigravity через hosts");
+            progress(Working("проверяем запасной список адресов"));
             compatibility::verify_agent_pins(&coverage.agent_hosts, &ranked)?;
             compatibility_notes.push(format!(
                 "Antigravity: проверен резервный путь через hosts для {}",
@@ -703,7 +941,8 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
             ));
         }
         compatibility_notes.extend(coverage.notes);
-    }
+        browser_dns_confirmed && coverage.browser_rules_effective
+    };
 
     #[cfg(target_os = "macos")]
     {
@@ -739,19 +978,90 @@ pub fn apply_dns_rules() -> Result<NetworkSetup, String> {
         message: msg,
         local_relay_running: relay_ok,
         hosts_fallback,
-        compatibility_notes,
+        system_routes: policy != RoutePolicy::Physical,
+        browser_dns_confirmed,
+        primary_skipped: skip_primary,
     })
 }
 
-fn relay_answers() -> bool {
-    let query = client::build_query("daily-cloudcode-pa.googleapis.com", 0xA651);
-    client::query_raw_via(
-        &query,
-        LISTEN_IP.parse().unwrap(),
-        0,
-        Duration::from_secs(5),
-    )
-    .is_ok_and(|reply| client::is_successful_response(&reply))
+struct RelayAnswers {
+    agent_missing: Vec<&'static str>,
+    browser_missing: Vec<&'static str>,
+}
+
+fn relay_answers(skip_primary: bool, probe: impl Fn(&str) -> bool + Sync) -> RelayAnswers {
+    let agent: Vec<_> = NRPT_AGENT
+        .iter()
+        .copied()
+        .filter(|host| !skip_primary || *host != PRIMARY_CLOUD_CODE)
+        .collect();
+    let hosts: std::collections::BTreeSet<_> =
+        agent.iter().chain(SUBSTITUTION_CANARIES).copied().collect();
+    let missing: std::collections::BTreeSet<_> = thread::scope(|scope| {
+        let checks: Vec<_> = hosts
+            .into_iter()
+            .map(|host| {
+                let probe = &probe;
+                (host, scope.spawn(move || probe(host)))
+            })
+            .collect();
+        checks
+            .into_iter()
+            .filter_map(|(host, result)| (!result.join().unwrap_or(false)).then_some(host))
+            .collect()
+    });
+    RelayAnswers {
+        agent_missing: agent
+            .into_iter()
+            .filter(|host| missing.contains(host))
+            .collect(),
+        browser_missing: SUBSTITUTION_CANARIES
+            .iter()
+            .copied()
+            .filter(|host| missing.contains(host))
+            .collect(),
+    }
+}
+
+fn relay_returns_address(host: &str) -> bool {
+    relay_returns_address_within(host, Duration::from_secs(5))
+}
+
+fn relay_returns_address_within(host: &str, timeout: Duration) -> bool {
+    let query = client::build_query(host, 0xA651);
+    client::query_raw_via(&query, LISTEN_IP.parse().unwrap(), 0, timeout)
+        .is_ok_and(|reply| has_usable_a_answer(&query, &reply))
+}
+
+fn has_usable_a_answer(query: &[u8], reply: &[u8]) -> bool {
+    client::response_matches(query, reply)
+        && client::is_successful_response(reply)
+        && client::answer_addrs(reply)
+            .into_iter()
+            .any(|address| match address {
+                std::net::IpAddr::V4(ip) => {
+                    !ip.is_unspecified()
+                        && !ip.is_loopback()
+                        && !ip.is_private()
+                        && !ip.is_link_local()
+                        && !ip.is_multicast()
+                        && !ip.is_broadcast()
+                }
+                std::net::IpAddr::V6(_) => false,
+            })
+}
+
+#[cfg(target_os = "linux")]
+pub fn apply_linux_dns_on_service_start() -> Result<(), String> {
+    // Manual setup holds the lock and verifies the data path before applying
+    // DNS itself. ExecStartPost must not modify system DNS in the meantime.
+    let Some(_configuration) = try_configuration_lock()? else {
+        return Ok(());
+    };
+    if !wait_for_ready(Duration::from_secs(4), relay_ready) {
+        return Err("DNS-служба не подтвердила готовность; настройки DNS сохранены".into());
+    }
+    linux_dns::apply()
 }
 
 pub(crate) fn relay_ready(timeout: Duration) -> bool {
@@ -788,6 +1098,91 @@ pub(crate) fn wait_for_ready(budget: Duration, mut probe: impl FnMut(Duration) -
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[test]
+    fn substitution_probes_run_concurrently_once_per_host() {
+        let calls = std::sync::Mutex::new(Vec::new());
+        let started = std::time::Instant::now();
+        let result = substitutions_by_host(
+            NRPT_AGENT
+                .iter()
+                .copied()
+                .chain(SUBSTITUTION_CANARIES.iter().copied())
+                .chain([".gemini.google.com"]),
+            |host| {
+                calls.lock().unwrap().push(host.to_string());
+                std::thread::sleep(Duration::from_millis(200));
+                if host == "generativelanguage.googleapis.com" {
+                    vec!["192.0.2.1".into()]
+                } else {
+                    Vec::new()
+                }
+            },
+        );
+        // Seven distinct hosts at 200 ms each would take 1.4 s sequentially.
+        assert!(started.elapsed() < Duration::from_millis(1000));
+        let mut calls = calls.into_inner().unwrap();
+        calls.sort();
+        let before = calls.len();
+        calls.dedup();
+        assert_eq!(before, calls.len(), "a host was probed twice");
+        assert_eq!(calls.len(), 7);
+        assert_eq!(result["generativelanguage.googleapis.com"], ["192.0.2.1"]);
+        assert!(result["gemini.google.com"].is_empty());
+    }
+
+    #[test]
+    fn relay_requires_a_matching_address_answer_for_a_public_domain() {
+        use std::net::Ipv4Addr;
+        let query = client::build_query(provider::DAILY_CLOUD_CODE, 17);
+        assert!(!has_usable_a_answer(
+            &query,
+            &client::nodata_response(&query)
+        ));
+        assert!(!has_usable_a_answer(
+            &query,
+            &client::servfail_response(&query)
+        ));
+        for ip in [
+            [0, 0, 0, 0],
+            [127, 0, 0, 1],
+            [169, 254, 0, 1],
+            [10, 0, 0, 1],
+            [224, 0, 0, 1],
+            [255; 4],
+        ] {
+            let reply = client::address_response(&query, &[Ipv4Addr::from(ip)]).unwrap();
+            assert!(!has_usable_a_answer(&query, &reply));
+        }
+        let address = Ipv4Addr::new(192, 0, 2, 17);
+        let wrong_query = client::build_query("other.test", 17);
+        let wrong_reply = client::address_response(&wrong_query, &[address]).unwrap();
+        assert!(!has_usable_a_answer(&query, &wrong_reply));
+        assert!(has_usable_a_answer(
+            &query,
+            &client::address_response(&query, &[address]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn relay_can_report_browser_failure_separately_from_agent() {
+        let browser_host = "aistudio.google.com";
+        let status = relay_answers(false, |host| host != browser_host);
+        assert!(status.agent_missing.is_empty());
+        assert_eq!(status.browser_missing, [browser_host]);
+
+        let status = relay_answers(false, |host| host != provider::DAILY_CLOUD_CODE);
+        assert_eq!(status.agent_missing, [provider::DAILY_CLOUD_CODE]);
+        assert!(status.browser_missing.is_empty());
+
+        let status = relay_answers(true, |host| {
+            assert_ne!(host, PRIMARY_CLOUD_CODE);
+            true
+        });
+        assert!(status.agent_missing.is_empty());
+        assert!(status.browser_missing.is_empty());
+    }
+
     #[test]
     fn slow_probe_cannot_multiply_the_startup_budget() {
         let start = std::time::Instant::now();
@@ -820,12 +1215,18 @@ fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     linux_dns::remove()?;
     crate::system::service::disable()?;
-    // Remove only the obsolete marker from the experimental TUN mode.
-    let legacy_mode = relay::log_dir().join("hosts-mode");
-    match std::fs::remove_file(legacy_mode) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e.to_string()),
+    // Remove obsolete files: the marker from the experimental TUN mode and
+    // the route score table that releases before 2.2.1 maintained.
+    for legacy in [
+        relay::log_dir().join("hosts-mode"),
+        config::directory().join("route-health.json"),
+        config::directory().join("route-health.lock"),
+    ] {
+        match std::fs::remove_file(legacy) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
     }
     if let Err(e) = crate::net::hosts::remove_entries() {
         errors.push(e);
@@ -841,6 +1242,9 @@ fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         if let Err(e) = remove_static_routes() {
+            errors.push(e);
+        }
+        if let Err(e) = web_rules::forget() {
             errors.push(e);
         }
         if let Err(e) = crate::net::nrpt::native_remove_nrpt_rules() {
@@ -862,6 +1266,7 @@ fn remove_dns_configuration(restore_tcp: bool) -> Result<(), String> {
     }
     resolvers::invalidate_network_caches();
     if errors.is_empty() {
+        relay::save_route_policy(RoutePolicy::Physical)?;
         Ok(())
     } else {
         Err(errors.join("; "))

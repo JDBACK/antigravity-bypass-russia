@@ -12,7 +12,8 @@ function Write-Usage {
 
 Режимы:
   (по умолчанию)      Найти Antigravity CLI и применить файловый патч (patch-files)
-  --restore, restore  Восстановить оригинальный бинарник CLI из бэкапа (restore-files)
+  --all, all          Применить ко всем найденным файлам Antigravity (CLI, App, IDE)
+  --restore, restore  Восстановить оригинальные файлы из бэкапа (restore-files)
   --status, status    Показать текущий статус патча CLI и системы
   --rebuild           Принудительно пересобрать Rust-движок перед запуском
   -h, --help          Показать эту справку
@@ -29,6 +30,7 @@ function Fail {
 }
 
 $action = 'patch-files'
+$allTargets = $false
 $rebuild = $false
 $cliPath = ''
 $positionalOnly = $false
@@ -45,6 +47,7 @@ for ($i = 0; $i -lt $args.Count; $i++) {
         { $_ -in '--status', 'status' } { $action = 'status'; continue }
         { $_ -in '--restore', 'restore' } { $action = 'restore-files'; continue }
         { $_ -in '--patch', 'patch' } { $action = 'patch-files'; continue }
+        { $_ -in '--all', 'all' } { $allTargets = $true; continue }
         '--rebuild' { $rebuild = $true; continue }
         '--' { $positionalOnly = $true; continue }
         { $_ -like '-*' } {
@@ -307,8 +310,27 @@ if (Test-NeedsBuild) {
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
+if ($allTargets -and $cliPath) {
+    [Console]::Error.WriteLine('Нельзя одновременно указывать --all и конкретный путь.')
+    Write-Usage
+    exit 2
+}
+
 if ($action -eq 'status') {
     & $engine 'status'
+    exit $LASTEXITCODE
+}
+
+if ($action -eq 'patch-files' -and (-not $env:AGY_CLI_DISABLE_AUTO_UPDATE)) {
+    try {
+        if (-not [Console]::IsErrorRedirected) {
+            [Console]::Error.WriteLine('Совет: чтобы автообновление agy не затирало патч, задайте AGY_CLI_DISABLE_AUTO_UPDATE=1.')
+        }
+    } catch {}
+}
+
+if ($allTargets) {
+    & $engine $action
     exit $LASTEXITCODE
 }
 

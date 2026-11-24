@@ -1,13 +1,17 @@
 use crate::core::{
-    detector::{is_agy_cli_name, FoundTarget, TargetKind},
+    detector::{FoundTarget, TargetKind},
     opcodes::*,
 };
 use crate::system::journal;
 use object::{Architecture, Object, ObjectSection, SectionKind};
 use std::{
+    borrow::Cow,
+    collections::HashMap,
     fs,
-    path::Path,
+    ops::Range,
+    path::{Path, PathBuf},
     sync::{Mutex, MutexGuard},
+    time::SystemTime,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,12 +49,37 @@ pub fn operation_guard() -> MutexGuard<'static, ()> {
     OPERATIONS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-pub(crate) struct Plan {
-    pub data: Vec<u8>,
+/// `data` borrows the input until the first byte is changed, so read-only
+/// state checks of large executables never allocate a second full copy.
+pub(crate) struct Plan<'a> {
+    pub data: Cow<'a, [u8]>,
     pub changes: usize,
     pub existing: usize,
     pub profile: String,
 }
+impl Plan<'_> {
+    fn into_owned(self) -> Plan<'static> {
+        Plan {
+            data: Cow::Owned(self.data.into_owned()),
+            changes: self.changes,
+            existing: self.existing,
+            profile: self.profile,
+        }
+    }
+}
+
+/// Unsupported-version errors name the file digest. Hashing a 100 MB binary is
+/// deferred until a caller actually reports the error to the user.
+const DIGEST_PLACEHOLDER: &str = "{sha256}";
+
+fn with_digest(error: String, data: &[u8]) -> String {
+    if error.contains(DIGEST_PLACEHOLDER) {
+        error.replace(DIGEST_PLACEHOLDER, &journal::digest(data))
+    } else {
+        error
+    }
+}
+
 pub(crate) fn state_from_counts(stock: usize, patched: usize) -> BinaryState {
     match (stock > 0, patched > 0) {
         (true, true) => BinaryState::PartiallyPatched,
@@ -59,16 +88,31 @@ pub(crate) fn state_from_counts(stock: usize, patched: usize) -> BinaryState {
         _ => BinaryState::Unknown,
     }
 }
-pub(crate) fn plan_js(data: &[u8]) -> Result<Plan, String> {
+/// `Apply` builds the patched bytes; `Count` only counts stock and patched
+/// sites, so a status check never copies a large executable. Both run the same
+/// format checks and return the same counts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Apply,
+    Count,
+}
+
+#[cfg(test)]
+pub(crate) fn plan_js(data: &[u8]) -> Result<Plan<'_>, String> {
+    plan_js_mode(data, Mode::Apply)
+}
+
+pub(crate) fn plan_js_mode(data: &[u8], mode: Mode) -> Result<Plan<'_>, String> {
     let text = std::str::from_utf8(data).map_err(|_| "JavaScript не в UTF-8")?;
-    let mut output = data.to_vec();
+    let mut output = Cow::Borrowed(data);
     let re = regex_ide_main_js_stock();
     let spans: Vec<_> = re
         .captures_iter(text)
         .map(|c| (c.get(1).unwrap().end(), c.get(0).unwrap().end()))
         .collect();
     let existing = regex_ide_js_patched().find_iter(text).count();
-    for (start, end) in &spans {
+    for (start, end) in spans.iter().filter(|_| mode == Mode::Apply) {
+        let output = output.to_mut();
         output[*start..*end].fill(b' ');
         output[*start..*start + 4].copy_from_slice(b"true");
     }
@@ -80,19 +124,57 @@ pub(crate) fn plan_js(data: &[u8]) -> Result<Plan, String> {
     })
 }
 
-fn apply_pattern(
-    bytes: &mut [u8],
+fn section_range(start: u64, size: u64) -> Result<Range<usize>, String> {
+    let start = usize::try_from(start).map_err(|_| "Некорректное смещение секции")?;
+    let end = start
+        .checked_add(usize::try_from(size).map_err(|_| "Некорректная секция")?)
+        .ok_or("Переполнение секции")?;
+    Ok(start..end)
+}
+
+fn section_bytes<'b>(output: &'b [u8], range: &Range<usize>) -> Result<&'b [u8], String> {
+    output
+        .get(range.clone())
+        .ok_or_else(|| "Секция за пределами файла".into())
+}
+
+/// Stock offsets (relative to the section) and the number of patched sites.
+type Sites = (Vec<usize>, usize);
+
+fn pair_sites(
+    bytes: &[u8],
     original: &regex::bytes::Regex,
     patched: &regex::bytes::Regex,
+) -> Sites {
+    (
+        original.find_iter(bytes).map(|m| m.start()).collect(),
+        patched.find_iter(bytes).count(),
+    )
+}
+
+fn x64_manager_sites(bytes: &[u8]) -> Sites {
+    pair_sites(bytes, regex_mgr_x64_orig(), regex_mgr_x64_patched())
+}
+
+/// Rewrites the stock sites of one section; the output is copied only when a
+/// stock site is actually rewritten.
+fn rewrite_sites(
+    output: &mut Cow<'_, [u8]>,
+    section_range: Range<usize>,
+    (offsets, existing): Sites,
     fix: &[u8],
     fix_at: usize,
     max_matches: usize,
+    mode: Mode,
 ) -> Result<(usize, usize), String> {
-    let offsets: Vec<_> = original.find_iter(bytes).map(|m| m.start()).collect();
-    let existing = patched.find_iter(bytes).count();
     if offsets.len() + existing > max_matches {
         return Err("Неоднозначная машинная сигнатура; файл не изменён".into());
     }
+    if offsets.is_empty() || mode == Mode::Count {
+        return Ok((offsets.len(), existing));
+    }
+    section_bytes(output, &section_range)?;
+    let bytes = &mut output.to_mut()[section_range];
     for offset in &offsets {
         let at = offset
             .checked_add(fix_at)
@@ -104,6 +186,29 @@ fn apply_pattern(
         slot.copy_from_slice(fix);
     }
     Ok((offsets.len(), existing))
+}
+
+/// Searches the current bytes of the section, then rewrites its stock sites.
+#[cfg(test)]
+fn apply_pattern(
+    output: &mut Cow<'_, [u8]>,
+    section_range: Range<usize>,
+    original: &regex::bytes::Regex,
+    patched: &regex::bytes::Regex,
+    fix: &[u8],
+    fix_at: usize,
+    max_matches: usize,
+) -> Result<(usize, usize), String> {
+    let sites = pair_sites(section_bytes(output, &section_range)?, original, patched);
+    rewrite_sites(
+        output,
+        section_range,
+        sites,
+        fix,
+        fix_at,
+        max_matches,
+        Mode::Apply,
+    )
 }
 
 fn cli_x64_branches_share_target(bytes: &[u8]) -> bool {
@@ -122,10 +227,16 @@ enum X64GateState {
     Patched,
 }
 
+type X64Gates = Vec<(usize, X64GateState)>;
+
 /// Inspect all supported variants together. Looking only for stock/v2 misses
 /// a v1 gate beside a stock gate and would back up a partially patched file.
-fn x64_cli_gates(data: &[u8]) -> Result<Option<Vec<(usize, X64GateState)>>, String> {
+fn x64_cli_gates(data: &[u8]) -> Result<Option<X64Gates>, String> {
     let file = object::File::parse(data).map_err(|e| e.to_string())?;
+    x64_cli_gates_in(&file, data)
+}
+
+fn x64_cli_gates_in(file: &object::File<'_>, data: &[u8]) -> Result<Option<X64Gates>, String> {
     if file.architecture() != Architecture::X86_64 {
         return Ok(None);
     }
@@ -134,11 +245,11 @@ fn x64_cli_gates(data: &[u8]) -> Result<Option<Vec<(usize, X64GateState)>>, Stri
         let Some((start, size)) = section.file_range() else {
             continue;
         };
-        let start = usize::try_from(start).map_err(|_| "Некорректное смещение секции")?;
-        let end = start
-            .checked_add(usize::try_from(size).map_err(|_| "Некорректная секция")?)
-            .ok_or("Переполнение секции")?;
-        let bytes = data.get(start..end).ok_or("Секция за пределами файла")?;
+        let range = section_range(start, size)?;
+        let start = range.start;
+        let bytes = section_bytes(data, &range)?;
+        // Separate searches: each variant has a long literal prefix for the
+        // regex prefilter, which a combined pattern (`test rax, rax` only) lacks.
         for (pattern, state) in [
             (regex_cli_x64_long_orig(), X64GateState::Stock),
             (regex_cli_x64_long_v1_patched(), X64GateState::Legacy),
@@ -155,26 +266,29 @@ fn x64_cli_gates(data: &[u8]) -> Result<Option<Vec<(usize, X64GateState)>>, Stri
     gates.sort_unstable_by_key(|(offset, _)| *offset);
     if !(1..=2).contains(&gates.len()) || gates.windows(2).any(|pair| pair[0].0 + 19 > pair[1].0) {
         return Err(format!(
-            "Версия не поддерживается профилем agy-x64-long-v2: совпадений {}. SHA-256 {}",
+            "Версия не поддерживается профилем agy-x64-long-v2: совпадений {}. SHA-256 {DIGEST_PLACEHOLDER}",
             gates.len(),
-            journal::digest(data)
         ));
     }
     Ok(Some(gates))
 }
 
-fn x64_backend_cli_gate(data: &[u8]) -> Result<Option<(usize, X64GateState)>, String> {
-    let file = object::File::parse(data).map_err(|e| e.to_string())?;
+fn x64_backend_cli_gate_in(
+    file: &object::File<'_>,
+    data: &[u8],
+    diagnostic_gates: &[(usize, X64GateState)],
+) -> Result<Option<(usize, X64GateState)>, String> {
     if file.architecture() != Architecture::X86_64 {
         return Ok(None);
     }
     let mut found = None;
     for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
-        let Some((start, _)) = section.file_range() else {
+        let Some((start, size)) = section.file_range() else {
             continue;
         };
-        let start = usize::try_from(start).map_err(|_| "Некорректное смещение секции")?;
-        let bytes = section.data().map_err(|e| e.to_string())?;
+        let range = section_range(start, size)?;
+        let start = range.start;
+        let bytes = section_bytes(data, &range)?;
         for (pattern, state) in [
             (regex_cli_x64_backend_orig(), X64GateState::Stock),
             (regex_cli_x64_backend_patched(), X64GateState::Patched),
@@ -202,8 +316,9 @@ fn x64_backend_cli_gate(data: &[u8]) -> Result<Option<(usize, X64GateState)>, St
                 {
                     return Err("Некорректные переходы agy x64 backend; файл не изменён".into());
                 }
-                let helpers = x64_cli_gates(data)?.ok_or("Нет диагностической функции agy x64")?;
-                if helpers.len() != 1 || helpers[0].0 != start + helper as usize + 32 {
+                if diagnostic_gates.len() != 1
+                    || diagnostic_gates[0].0 != start + helper as usize + 32
+                {
                     return Err(
                         "Вызов agy x64 backend не ведёт в проверенную диагностическую функцию"
                             .into(),
@@ -218,12 +333,17 @@ fn x64_backend_cli_gate(data: &[u8]) -> Result<Option<(usize, X64GateState)>, St
     Ok(found)
 }
 
-fn plan_x64_cli(data: &[u8], legacy_cli: bool) -> Result<Plan, String> {
-    let diagnostic_gates = x64_cli_gates(data)?.ok_or("Нет профиля agy x64")?;
+fn plan_x64_cli<'a>(
+    file: &object::File<'_>,
+    data: &'a [u8],
+    legacy_cli: bool,
+    diagnostic_gates: X64Gates,
+    mode: Mode,
+) -> Result<Plan<'a>, String> {
     let backend_gate = if legacy_cli {
         None
     } else {
-        x64_backend_cli_gate(data)?
+        x64_backend_cli_gate_in(file, data, &diagnostic_gates)?
     };
     if backend_gate.is_some()
         && diagnostic_gates
@@ -245,7 +365,7 @@ fn plan_x64_cli(data: &[u8], legacy_cli: bool) -> Result<Plan, String> {
     }) {
         return Err("Обнаружен старый или смешанный патч agy-x64-long-v1; необходим проверенный исходный backup".into());
     }
-    let mut output = data.to_vec();
+    let mut output = Cow::Borrowed(data);
     let mut changes = 0;
     for (offset, state) in &gates {
         if *state == X64GateState::Stock {
@@ -254,7 +374,11 @@ fn plan_x64_cli(data: &[u8], legacy_cli: bool) -> Result<Plan, String> {
             } else {
                 (CLI_GATE_X64_LONG_FIX, CLI_GATE_X64_LONG_FIX_AT)
             };
-            output[offset + at..offset + at + fix.len()].copy_from_slice(fix);
+            // The gate edit cannot create or remove a manager-gate match (their
+            // fixed bytes never overlap), so counting can skip it.
+            if mode == Mode::Apply {
+                output.to_mut()[offset + at..offset + at + fix.len()].copy_from_slice(fix);
+            }
             changes += 1;
         }
     }
@@ -264,26 +388,14 @@ fn plan_x64_cli(data: &[u8], legacy_cli: bool) -> Result<Plan, String> {
     // Older CLI builds may lack this gate. Keep the legacy planner byte-exact
     // for backup migration, and include both gates in the current transaction.
     if !legacy_cli {
-        let file = object::File::parse(data).map_err(|e| e.to_string())?;
         for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
             let Some((start, size)) = section.file_range() else {
                 continue;
             };
-            let start = usize::try_from(start).map_err(|_| "Некорректное смещение секции")?;
-            let end = start
-                .checked_add(usize::try_from(size).map_err(|_| "Некорректная секция")?)
-                .ok_or("Переполнение секции")?;
-            let bytes = output
-                .get_mut(start..end)
-                .ok_or("Секция за пределами файла")?;
-            let (stock, patched) = apply_pattern(
-                bytes,
-                regex_mgr_x64_orig(),
-                regex_mgr_x64_patched(),
-                MGR_GATE_X64_FIX,
-                0,
-                1,
-            )?;
+            let range = section_range(start, size)?;
+            let sites = x64_manager_sites(section_bytes(&output, &range)?);
+            let (stock, patched) =
+                rewrite_sites(&mut output, range, sites, MGR_GATE_X64_FIX, 0, 1, mode)?;
             hub_sites += stock + patched;
             changes += stock;
             existing += patched;
@@ -334,49 +446,112 @@ fn cli_arm64_branches_are_valid(bytes: &[u8], offset: usize, section_size: usize
         && inside(details)
 }
 
-fn plan_arm64_cli(file: &object::File<'_>, data: &[u8]) -> Result<Plan, String> {
-    let mut output = data.to_vec();
+/// Whether the sign-in gate matches could differ after the core edits at
+/// `core_offsets`. Both gate patterns are 20 bytes, so only matches that
+/// overlap an edit can change; those cases are counted from patched bytes.
+fn core_edit_touches_login(bytes: &[u8], core_offsets: &[usize], login_found: &[usize]) -> bool {
+    const LOGIN_LEN: usize = 20;
+    core_offsets.iter().any(|&edit| {
+        let edit_end = edit + MGR_GATE_ARM64_FIX.len();
+        if login_found
+            .iter()
+            .any(|&login| login < edit_end && edit < login + LOGIN_LEN)
+        {
+            return true;
+        }
+        let start = edit.saturating_sub(LOGIN_LEN - 1);
+        let end = (edit_end + LOGIN_LEN - 1).min(bytes.len());
+        let Some(window) = bytes.get(start..end) else {
+            return true;
+        };
+        let mut window = window.to_vec();
+        let at = edit - start;
+        if window.len() < at + MGR_GATE_ARM64_FIX.len() {
+            return true;
+        }
+        window[at..at + MGR_GATE_ARM64_FIX.len()].copy_from_slice(MGR_GATE_ARM64_FIX);
+        regex_cli_arm64_orig().is_match(&window) || regex_cli_arm64_patched().is_match(&window)
+    })
+}
+
+fn plan_arm64_cli<'a>(
+    file: &object::File<'_>,
+    data: &'a [u8],
+    mode: Mode,
+) -> Result<Plan<'a>, String> {
+    let mut output = Cow::Borrowed(data);
     let (mut core_stock, mut core_patched, mut login_stock, mut login_patched) = (0, 0, 0, 0);
     for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
         let Some((offset, size)) = section.file_range() else {
             continue;
         };
-        let start = usize::try_from(offset).map_err(|_| "Некорректное смещение секции")?;
-        let end = start
-            .checked_add(usize::try_from(size).map_err(|_| "Некорректная секция")?)
-            .ok_or("Переполнение секции")?;
-        let bytes = output
-            .get_mut(start..end)
-            .ok_or("Секция за пределами файла")?;
+        let range = section_range(offset, size)?;
+        let bytes = section_bytes(&output, &range)?;
+        // The validation matches are reused for patching instead of searching
+        // the same section again with the same four patterns.
+        let login_stock_found: Vec<_> = regex_cli_arm64_orig().find_iter(bytes).collect();
+        let login_patched_found: Vec<_> = regex_cli_arm64_patched().find_iter(bytes).collect();
+        let core_stock_found: Vec<_> = regex_mgr_arm64_orig().find_iter(bytes).collect();
+        let core_patched_found: Vec<_> = regex_mgr_arm64_patched().find_iter(bytes).collect();
         if !section.address().is_multiple_of(4)
-            || regex_cli_arm64_orig()
-                .find_iter(bytes)
-                .chain(regex_cli_arm64_patched().find_iter(bytes))
+            || login_stock_found
+                .iter()
+                .chain(&login_patched_found)
                 .any(|m| !cli_arm64_branches_are_valid(m.as_bytes(), m.start(), bytes.len()))
-            || regex_mgr_arm64_orig()
-                .find_iter(bytes)
-                .chain(regex_mgr_arm64_patched().find_iter(bytes))
+            || core_stock_found
+                .iter()
+                .chain(&core_patched_found)
                 .any(|m| !m.start().is_multiple_of(4))
         {
             return Err("Некорректные переходы или выравнивание agy ARM64; файл не изменён".into());
         }
-        let (stock, patched) = apply_pattern(
-            bytes,
-            regex_mgr_arm64_orig(),
-            regex_mgr_arm64_patched(),
+        let starts = |found: &[regex::bytes::Match<'_>]| -> Vec<usize> {
+            found.iter().map(|m| m.start()).collect()
+        };
+        let core_offsets = starts(&core_stock_found);
+        if mode == Mode::Count {
+            let login_found: Vec<usize> = starts(&login_stock_found)
+                .into_iter()
+                .chain(starts(&login_patched_found))
+                .collect();
+            if core_edit_touches_login(bytes, &core_offsets, &login_found) {
+                // Rare overlap: count from the patched bytes, as patching does.
+                return plan_arm64_cli(file, data, Mode::Apply);
+            }
+        }
+        let core_sites = (core_offsets, core_patched_found.len());
+        let login_sites: Sites = (starts(&login_stock_found), login_patched_found.len());
+        let (stock, patched) = rewrite_sites(
+            &mut output,
+            range.clone(),
+            core_sites,
             MGR_GATE_ARM64_FIX,
             0,
             1,
+            mode,
         )?;
         core_stock += stock;
         core_patched += patched;
-        let (stock, patched) = apply_pattern(
-            bytes,
-            regex_cli_arm64_orig(),
-            regex_cli_arm64_patched(),
+        // The sign-in gate is searched in the bytes after the core edit, as
+        // before; without a core edit (or when counting, where the edit was
+        // shown not to touch it) the section bytes are unchanged.
+        let login_sites = if stock > 0 && mode == Mode::Apply {
+            pair_sites(
+                section_bytes(&output, &range)?,
+                regex_cli_arm64_orig(),
+                regex_cli_arm64_patched(),
+            )
+        } else {
+            login_sites
+        };
+        let (stock, patched) = rewrite_sites(
+            &mut output,
+            range,
+            login_sites,
             CLI_GATE_ARM64_FIX,
             CLI_GATE_ARM64_FIX_AT,
             1,
+            mode,
         )?;
         login_stock += stock;
         login_patched += patched;
@@ -385,10 +560,9 @@ fn plan_arm64_cli(file: &object::File<'_>, data: &[u8]) -> Result<Plan, String> 
     // independent sign-in gate is absent or ambiguous in a future executable.
     if core_stock + core_patched != 1 || login_stock + login_patched != 1 {
         return Err(format!(
-            "Версия не поддерживается профилем agy-arm64-v2: core {}, login {}. SHA-256 {}",
+            "Версия не поддерживается профилем agy-arm64-v2: core {}, login {}. SHA-256 {DIGEST_PLACEHOLDER}",
             core_stock + core_patched,
             login_stock + login_patched,
-            journal::digest(data)
         ));
     }
     Ok(Plan {
@@ -399,73 +573,75 @@ fn plan_arm64_cli(file: &object::File<'_>, data: &[u8]) -> Result<Plan, String> 
     })
 }
 
-fn plan_binary(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
+fn plan_binary(data: &[u8], kind: TargetKind) -> Result<Plan<'_>, String> {
     plan_binary_with_cli_profile(data, kind, false)
+}
+
+fn arm64_manager_sites(bytes: &[u8]) -> Sites {
+    pair_sites(bytes, regex_mgr_arm64_orig(), regex_mgr_arm64_patched())
 }
 
 fn plan_binary_with_cli_profile(
     data: &[u8],
     kind: TargetKind,
     legacy_cli: bool,
-) -> Result<Plan, String> {
+) -> Result<Plan<'_>, String> {
+    plan_binary_mode(data, kind, legacy_cli, Mode::Apply)
+}
+
+fn plan_binary_mode(
+    data: &[u8],
+    kind: TargetKind,
+    legacy_cli: bool,
+    mode: Mode,
+) -> Result<Plan<'_>, String> {
     let file = object::File::parse(data)
         .map_err(|e| format!("Неподдерживаемый executable (PE/ELF/Mach-O): {e}"))?;
     if kind == TargetKind::AgyCli && file.architecture() == Architecture::Aarch64 && !legacy_cli {
-        return plan_arm64_cli(&file, data);
+        return plan_arm64_cli(&file, data, mode);
     }
     if kind == TargetKind::AgyCli && file.architecture() == Architecture::X86_64 {
-        return plan_x64_cli(data, legacy_cli);
+        let gates = x64_cli_gates_in(&file, data)?.ok_or("Нет профиля agy x64")?;
+        return plan_x64_cli(&file, data, legacy_cli, gates, mode);
     }
-    let (original, patched, fix, fix_at, max_matches, profile) = match (kind, file.architecture()) {
-        (TargetKind::LanguageServer, Architecture::X86_64) => (
-            regex_mgr_x64_orig(),
-            regex_mgr_x64_patched(),
-            MGR_GATE_X64_FIX,
-            0,
-            1,
-            "core-x64-v1",
-        ),
-        (TargetKind::LanguageServer, Architecture::Aarch64) => (
-            regex_mgr_arm64_orig(),
-            regex_mgr_arm64_patched(),
-            MGR_GATE_ARM64_FIX,
-            0,
-            1,
-            "core-arm64-v1",
-        ),
-        (TargetKind::AgyCli, Architecture::Aarch64) => (
-            regex_mgr_arm64_orig(),
-            regex_mgr_arm64_patched(),
-            MGR_GATE_ARM64_FIX,
-            0,
-            1,
-            "agy-arm64-v1",
-        ),
-        _ => return Err("Нет профиля патча для этой архитектуры/компонента".into()),
-    };
-    let mut output = data.to_vec();
+    let (sites, fix, fix_at, max_matches, profile): (fn(&[u8]) -> Sites, _, _, _, _) =
+        match (kind, file.architecture()) {
+            (TargetKind::LanguageServer, Architecture::X86_64) => {
+                (x64_manager_sites, MGR_GATE_X64_FIX, 0, 1, "core-x64-v1")
+            }
+            (TargetKind::LanguageServer, Architecture::Aarch64) => (
+                arm64_manager_sites,
+                MGR_GATE_ARM64_FIX,
+                0,
+                1,
+                "core-arm64-v1",
+            ),
+            (TargetKind::AgyCli, Architecture::Aarch64) => (
+                arm64_manager_sites,
+                MGR_GATE_ARM64_FIX,
+                0,
+                1,
+                "agy-arm64-v1",
+            ),
+            _ => return Err("Нет профиля патча для этой архитектуры/компонента".into()),
+        };
+    let mut output = Cow::Borrowed(data);
     let (mut changes, mut existing) = (0, 0);
     for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
         let Some((offset, size)) = section.file_range() else {
             continue;
         };
-        let start = usize::try_from(offset).map_err(|_| "Некорректное смещение секции")?;
-        let end = start
-            .checked_add(usize::try_from(size).map_err(|_| "Некорректная секция")?)
-            .ok_or("Переполнение секции")?;
-        let section_bytes = output
-            .get_mut(start..end)
-            .ok_or("Секция за пределами файла")?;
-        let (c, p) = apply_pattern(section_bytes, original, patched, fix, fix_at, max_matches)?;
+        let range = section_range(offset, size)?;
+        let found = sites(section_bytes(&output, &range)?);
+        let (c, p) = rewrite_sites(&mut output, range, found, fix, fix_at, max_matches, mode)?;
         changes += c;
         existing += p;
     }
     let total = changes + existing;
     if total == 0 || total > max_matches {
         return Err(format!(
-            "Версия не поддерживается профилем {profile}: совпадений {}. SHA-256 {}",
+            "Версия не поддерживается профилем {profile}: совпадений {}. SHA-256 {DIGEST_PLACEHOLDER}",
             changes + existing,
-            journal::digest(data)
         ));
     }
     Ok(Plan {
@@ -476,47 +652,112 @@ fn plan_binary_with_cli_profile(
     })
 }
 
-fn plan(data: &[u8], kind: TargetKind) -> Result<Plan, String> {
+/// A legacy v1 x64 CLI patch needs its verified backup; anything else gets a
+/// plan. The x64 gates are parsed and searched once for both decisions.
+enum Scan<'a> {
+    LegacyX64,
+    Plan(Result<Plan<'a>, String>),
+}
+
+fn scan(data: &[u8], kind: TargetKind, mode: Mode) -> Scan<'_> {
+    if kind == TargetKind::AgyCli {
+        if let Ok(file) = object::File::parse(data) {
+            if file.architecture() == Architecture::X86_64 {
+                return match x64_cli_gates_in(&file, data) {
+                    Ok(Some(gates))
+                        if gates
+                            .iter()
+                            .any(|(_, state)| *state == X64GateState::Legacy)
+                            || (gates
+                                .iter()
+                                .any(|(_, state)| *state == X64GateState::Patched)
+                                && x64_backend_cli_gate_in(&file, data, &gates)
+                                    .is_ok_and(|gate| gate.is_some())) =>
+                    {
+                        Scan::LegacyX64
+                    }
+                    Ok(Some(gates)) => Scan::Plan(plan_x64_cli(&file, data, false, gates, mode)),
+                    Ok(None) => Scan::Plan(plan_mode(data, kind, mode)),
+                    Err(error) => Scan::Plan(Err(error)),
+                };
+            }
+        }
+    }
+    Scan::Plan(plan_mode(data, kind, mode))
+}
+
+fn plan(data: &[u8], kind: TargetKind) -> Result<Plan<'_>, String> {
+    plan_mode(data, kind, Mode::Apply)
+}
+
+fn plan_mode(data: &[u8], kind: TargetKind, mode: Mode) -> Result<Plan<'_>, String> {
     match kind {
-        TargetKind::IdeMainJs => plan_js(data),
-        TargetKind::IdeAsar => crate::core::asar::plan_asar(data),
-        _ => plan_binary(data, kind),
+        TargetKind::IdeMainJs => plan_js_mode(data, mode),
+        TargetKind::IdeAsar => crate::core::asar::plan_asar_mode(data, mode),
+        _ => plan_binary_mode(data, kind, false, mode),
     }
 }
-fn inferred_kind(path: &Path) -> TargetKind {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    if name.ends_with(".asar") {
-        TargetKind::IdeAsar
-    } else if name.ends_with(".js") {
-        TargetKind::IdeMainJs
-    } else if is_agy_cli_name(&name) {
-        TargetKind::AgyCli
-    } else {
-        TargetKind::LanguageServer
-    }
+/// File identity used to reuse a state result across dashboard redraws. Any
+/// update replaces the file (new mtime/size); patch/restore also clear it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
 }
-pub fn check_binary_state(path: &Path) -> BinaryState {
-    state_for_kind(path, inferred_kind(path))
+
+type StateCache = HashMap<(PathBuf, TargetKind), (FileStamp, BinaryState)>;
+static STATES: Mutex<Option<StateCache>> = Mutex::new(None);
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok()?,
+    })
+}
+
+fn forget_cached_states() {
+    if let Ok(mut cache) = STATES.lock() {
+        *cache = None;
+    }
 }
 
 pub fn check_target_state(target: &FoundTarget) -> BinaryState {
-    state_for_kind(&target.path, target.kind)
-}
-
-fn state_for_kind(path: &Path, kind: TargetKind) -> BinaryState {
-    let Ok(data) = fs::read(path) else {
+    let key = (target.path.clone(), target.kind);
+    let before = file_stamp(&target.path);
+    if let (Some(stamp), Ok(cache)) = (before, STATES.lock()) {
+        if let Some((cached, state)) = cache.as_ref().and_then(|c| c.get(&key)) {
+            if *cached == stamp {
+                return *state;
+            }
+        }
+    }
+    // A read error (for example a file briefly locked by the IDE or an
+    // updater) is reported as Unknown but never cached: the next refresh
+    // reads the unchanged file again.
+    let Ok(data) = fs::read(&target.path) else {
         return BinaryState::Unknown;
     };
-    state_for_data(&data, kind)
+    let state = state_for_data(&data, target.kind);
+    // A file replaced during the scan is not cached under either stamp.
+    if let Some(stamp) = before.filter(|stamp| file_stamp(&target.path) == Some(*stamp)) {
+        if let Ok(mut cache) = STATES.lock() {
+            let cache = cache.get_or_insert_with(HashMap::new);
+            if cache.len() >= 64 {
+                cache.clear();
+            }
+            cache.insert(key, (stamp, state));
+        }
+    }
+    state
 }
 
 fn state_for_data(data: &[u8], kind: TargetKind) -> BinaryState {
-    if kind == TargetKind::AgyCli && is_legacy_x64_cli(data) {
-        return BinaryState::PartiallyPatched;
-    }
-    match plan(data, kind) {
-        Ok(p) => state_from_counts(p.changes, p.existing),
-        Err(_) => BinaryState::Unknown,
+    // Status needs only the counts: never build (and copy) patched bytes.
+    match scan(data, kind, Mode::Count) {
+        Scan::LegacyX64 => BinaryState::PartiallyPatched,
+        Scan::Plan(Ok(p)) => state_from_counts(p.changes, p.existing),
+        Scan::Plan(Err(_)) => BinaryState::Unknown,
     }
 }
 
@@ -593,8 +834,12 @@ fn prepare_for_write(path: &Path, data: Vec<u8>, kind: TargetKind) -> Result<Vec
     Ok(data)
 }
 
+#[cfg(test)]
 fn is_legacy_x64_cli(data: &[u8]) -> bool {
-    x64_cli_gates(data).is_ok_and(|gates| {
+    let Ok(file) = object::File::parse(data) else {
+        return false;
+    };
+    x64_cli_gates_in(&file, data).is_ok_and(|gates| {
         gates.is_some_and(|gates| {
             gates
                 .iter()
@@ -602,7 +847,8 @@ fn is_legacy_x64_cli(data: &[u8]) -> bool {
                 || (gates
                     .iter()
                     .any(|(_, state)| *state == X64GateState::Patched)
-                    && x64_backend_cli_gate(data).is_ok_and(|gate| gate.is_some()))
+                    && x64_backend_cli_gate_in(&file, data, &gates)
+                        .is_ok_and(|gate| gate.is_some()))
         })
     })
 }
@@ -634,36 +880,36 @@ fn legacy_cli_backup_matches(original: &[u8], current: &[u8]) -> bool {
             return true;
         }
         if let Ok(file) = object::File::parse(original) {
+            let mut with_hub = Cow::Owned(expected);
             for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
                 let Some((start, size)) = section.file_range() else {
                     continue;
                 };
-                let (Ok(start), Ok(size)) = (usize::try_from(start), usize::try_from(size)) else {
+                let Ok(range) = section_range(start, size) else {
                     return false;
                 };
-                let Some(end) = start.checked_add(size) else {
+                let Ok(bytes) = section_bytes(&with_hub, &range) else {
                     return false;
                 };
-                let Some(bytes) = expected.get_mut(start..end) else {
-                    return false;
-                };
-                let _ = apply_pattern(
-                    bytes,
-                    regex_mgr_x64_orig(),
-                    regex_mgr_x64_patched(),
+                let sites = x64_manager_sites(bytes);
+                let _ = rewrite_sites(
+                    &mut with_hub,
+                    range,
+                    sites,
                     MGR_GATE_X64_FIX,
                     0,
                     1,
+                    Mode::Apply,
                 );
             }
-            if expected == current {
+            if *with_hub == *current {
                 return true;
             }
         }
         return false;
     }
     plan_binary_with_cli_profile(original, TargetKind::AgyCli, true)
-        .is_ok_and(|p| p.changes == 1 && p.existing == 0 && p.data == current)
+        .is_ok_and(|p| p.changes == 1 && p.existing == 0 && *p.data == *current)
 }
 
 fn legacy_backup_paths(path: &Path) -> Vec<std::path::PathBuf> {
@@ -683,14 +929,39 @@ fn verified_legacy_cli_backup(path: &Path, current: &[u8]) -> Option<Vec<u8>> {
 
 pub fn patch_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
     let _guard = operation_guard();
+    forget_cached_states();
+    let result = patch_target_locked(target);
+    forget_cached_states();
+    result
+}
+
+/// The outcome when a plan has nothing to change.
+fn unchanged_outcome(existing: usize, kind: TargetKind) -> Result<PatchOutcome, String> {
+    if existing > 0 {
+        Ok(PatchOutcome::AlreadyPatched)
+    } else if matches!(kind, TargetKind::IdeAsar) {
+        Ok(PatchOutcome::NotApplicable)
+    } else {
+        Err("Версия/сигнатура не поддерживается; файл не изменён".into())
+    }
+}
+
+fn patch_target_locked(target: &FoundTarget) -> Result<PatchOutcome, String> {
     crate::system::fs_utils::recover_pending(&target.path)?;
     ensure_not_symlink(&target.path)?;
     let mut before = fs::read(&target.path).map_err(|e| e.to_string())?;
-    let legacy_x64 = target.kind == TargetKind::AgyCli && is_legacy_x64_cli(&before);
-    let mut p = if legacy_x64 {
-        None
-    } else {
-        Some(plan(&before, target.kind)?)
+    let (legacy_x64, mut p) = match scan(&before, target.kind, Mode::Apply) {
+        Scan::LegacyX64 => (true, None),
+        Scan::Plan(planned) => {
+            let planned = planned.map_err(|e| with_digest(e, &before))?;
+            let partial =
+                target.kind == TargetKind::AgyCli && planned.changes > 0 && planned.existing > 0;
+            // Nothing to write: answer without copying the (borrowed) file.
+            if planned.changes == 0 && !partial {
+                return unchanged_outcome(planned.existing, target.kind);
+            }
+            (false, Some(planned.into_owned()))
+        }
     };
     let partial_cli = target.kind == TargetKind::AgyCli
         && p.as_ref().is_some_and(|p| p.changes > 0 && p.existing > 0);
@@ -700,7 +971,9 @@ pub fn patch_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
         if journal::has_record(&target.path) {
             let original = journal::verified_original(&target.path, &before)?
                 .ok_or("Backup старого патча исчез; файл не изменён")?;
-            let fresh = plan(&original, target.kind)?;
+            let fresh = plan(&original, target.kind)
+                .map_err(|e| with_digest(e, &original))?
+                .into_owned();
             if fresh.changes == 0 || fresh.existing > 0 {
                 return Err(
                     "Backup agy не содержит чистую исходную версию; обновление отменено".into(),
@@ -719,7 +992,9 @@ pub fn patch_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
                     "Обнаружен частичный патч agy, но точный исходный backup не найден; переустановите исходный agy"
                 },
             )?;
-            let fresh = plan(&original, target.kind)?;
+            let fresh = plan(&original, target.kind)
+                .map_err(|e| with_digest(e, &original))?
+                .into_owned();
             if fresh.existing != 0 {
                 return Err("Backup agy не содержит исходный файл; запись отменена".into());
             }
@@ -734,16 +1009,10 @@ pub fn patch_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
     }
     let p = p.ok_or("Нет проверенного плана патча")?;
     if p.changes == 0 {
-        return if p.existing > 0 {
-            Ok(PatchOutcome::AlreadyPatched)
-        } else if matches!(target.kind, TargetKind::IdeAsar) {
-            Ok(PatchOutcome::NotApplicable)
-        } else {
-            Err("Версия/сигнатура не поддерживается; файл не изменён".into())
-        };
+        return unchanged_outcome(p.existing, target.kind);
     }
     ensure_file_closed(&target.path)?;
-    let after = prepare_for_write(&target.path, p.data, target.kind)?;
+    let after = prepare_for_write(&target.path, p.data.into_owned(), target.kind)?;
     if require_continuation {
         journal::apply_continuing(&target.path, &before, &after, &p.profile)?;
     } else {
@@ -754,6 +1023,13 @@ pub fn patch_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
 
 pub fn restore_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
     let _guard = operation_guard();
+    forget_cached_states();
+    let result = restore_target_locked(target);
+    forget_cached_states();
+    result
+}
+
+fn restore_target_locked(target: &FoundTarget) -> Result<PatchOutcome, String> {
     crate::system::fs_utils::recover_pending(&target.path)?;
     ensure_not_symlink(&target.path)?;
     ensure_file_closed(&target.path)?;
@@ -790,7 +1066,7 @@ pub fn restore_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
     for backup in legacy_backup_paths(&target.path) {
         if let Ok(original) = fs::read(&backup) {
             let current_matches = plan(&original, target.kind)
-                .is_ok_and(|p| p.changes > 0 && p.existing == 0 && p.data == before);
+                .is_ok_and(|p| p.changes > 0 && p.existing == 0 && *p.data == *before);
             let old_cli_matches =
                 target.kind == TargetKind::AgyCli && legacy_cli_backup_matches(&original, &before);
             if current_matches || old_cli_matches {
@@ -1019,7 +1295,8 @@ mod tests {
         }
         assert!(plan_binary(&macho_fixture(x64, 0x01000007), TargetKind::AgyCli).is_err());
         let cli = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85\x00\x00\x00\x00";
-        let patched = plan_binary(&macho_fixture(cli, 0x01000007), TargetKind::AgyCli).unwrap();
+        let macho = macho_fixture(cli, 0x01000007);
+        let patched = plan_binary(&macho, TargetKind::AgyCli).unwrap();
         assert_eq!((patched.changes, patched.existing), (1, 0));
         assert_eq!(&patched.data[512 + 9..512 + 13], b"\x90\x90\x90\x90");
         assert_eq!(&patched.data[512..512 + 9], &cli[..9]);
@@ -1077,14 +1354,24 @@ mod tests {
         let hub = plan_binary(&stock, TargetKind::LanguageServer).ok();
         let hub_count = hub.as_ref().map_or(0, |p| p.changes);
         let hub_bytes = hub.as_ref().map_or(0, |p| {
-            stock.iter().zip(&p.data).filter(|(a, b)| a != b).count()
+            stock
+                .iter()
+                .zip(p.data.iter())
+                .filter(|(a, b)| a != b)
+                .count()
         });
         let patched = plan_binary(&stock, TargetKind::AgyCli).unwrap();
         assert_eq!((patched.changes, patched.existing), (gates + hub_count, 0));
+        let counted = plan_binary_mode(&stock, TargetKind::AgyCli, false, Mode::Count).unwrap();
+        assert_eq!(
+            (counted.changes, counted.existing),
+            (patched.changes, patched.existing)
+        );
+        assert!(matches!(counted.data, Cow::Borrowed(_)));
         assert_eq!(
             stock
                 .iter()
-                .zip(&patched.data)
+                .zip(patched.data.iter())
                 .filter(|(a, b)| a != b)
                 .count(),
             gates * 4 + hub_bytes
@@ -1127,7 +1414,7 @@ mod tests {
             }
             if migrate {
                 let signed =
-                    prepare_for_write(&target.path, legacy.data.clone(), target.kind).unwrap();
+                    prepare_for_write(&target.path, legacy.data.to_vec(), target.kind).unwrap();
                 journal::apply(&target.path, Some(&stock), &signed, "agy-x64-long-v1").unwrap();
             }
             assert_eq!(
@@ -1146,7 +1433,8 @@ mod tests {
         let stock = pe_fixture(code, 0x8664);
         let legacy = plan_binary_with_cli_profile(&stock, TargetKind::AgyCli, true)
             .unwrap()
-            .data;
+            .data
+            .into_owned();
         let dir = tempfile::tempdir().unwrap();
         let target = FoundTarget {
             path: dir.path().join("agy.exe"),
@@ -1169,7 +1457,8 @@ mod tests {
         let stock = pe_fixture(code, 0x8664);
         let legacy = plan_binary_with_cli_profile(&stock, TargetKind::AgyCli, true)
             .unwrap()
-            .data;
+            .data
+            .into_owned();
         let dir = tempfile::tempdir().unwrap();
         let target = FoundTarget {
             path: dir.path().join("agy.exe"),
@@ -1194,7 +1483,8 @@ mod tests {
         let stock = pe_fixture(code, 0x8664);
         let legacy = plan_binary_with_cli_profile(&stock, TargetKind::AgyCli, true)
             .unwrap()
-            .data;
+            .data
+            .into_owned();
         let dir = tempfile::tempdir().unwrap();
         let target = FoundTarget {
             path: dir.path().join("agy.exe"),
@@ -1297,7 +1587,10 @@ mod tests {
                 }
                 assert_eq!(patch_target(&target).unwrap(), PatchOutcome::Changed(2));
                 assert_eq!(check_target_state(&target), BinaryState::Patched);
-                let expected = plan_binary(&stock, TargetKind::AgyCli).unwrap().data;
+                let expected = plan_binary(&stock, TargetKind::AgyCli)
+                    .unwrap()
+                    .data
+                    .into_owned();
                 assert_eq!(fs::read(&target.path).unwrap(), expected);
                 assert_eq!(patch_target(&target).unwrap(), PatchOutcome::AlreadyPatched);
                 assert_eq!(restore_target(&target).unwrap(), PatchOutcome::Restored);
@@ -1362,7 +1655,10 @@ mod tests {
         };
         let stock = two_gate_x64_fixture();
         let mixed = mixed_x64_fixture(&stock, X64GateState::Stock);
-        let complete = plan_binary(&stock, TargetKind::AgyCli).unwrap().data;
+        let complete = plan_binary(&stock, TargetKind::AgyCli)
+            .unwrap()
+            .data
+            .into_owned();
         fs::write(&target.path, &stock).unwrap();
         journal::apply(&target.path, Some(&stock), &mixed, "agy-x64-long-v1").unwrap();
         journal::apply_continuing(&target.path, &mixed, &complete, "agy-x64-long-v2").unwrap();
@@ -1469,6 +1765,68 @@ mod tests {
     }
 
     #[test]
+    fn counting_matches_the_full_plan_without_copying() {
+        let manager = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
+        let gate = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85\x00\x00\x00\x00";
+        let cases: Vec<(Vec<u8>, TargetKind)> = vec![
+            (pe_fixture(manager, 0x8664), TargetKind::LanguageServer),
+            (
+                pe_fixture(&[gate.as_slice(), manager.as_slice()].concat(), 0x8664),
+                TargetKind::AgyCli,
+            ),
+            (macho_fixture(gate, 0x01000007), TargetKind::AgyCli),
+            (arm64_cli_fixture(ARM64_CORE), TargetKind::AgyCli),
+            (
+                pe_fixture(b"\x90\x90\x90\x90", 0x8664),
+                TargetKind::LanguageServer,
+            ),
+            (
+                b"x.resetIsTierGCPTos(), this.isGoogleInternal".to_vec(),
+                TargetKind::IdeMainJs,
+            ),
+        ];
+        for (stock, kind) in cases {
+            let full = plan_mode(&stock, kind, Mode::Apply);
+            let counted = plan_mode(&stock, kind, Mode::Count);
+            match (&full, &counted) {
+                (Ok(full), Ok(counted)) => {
+                    assert_eq!(
+                        (full.changes, full.existing),
+                        (counted.changes, counted.existing)
+                    );
+                    assert!(matches!(counted.data, Cow::Borrowed(_)));
+                    // The patched result counts the same way as well.
+                    let patched = full.data.to_vec();
+                    let again = plan_mode(&patched, kind, Mode::Apply).unwrap();
+                    let again_counted = plan_mode(&patched, kind, Mode::Count).unwrap();
+                    assert_eq!(
+                        (again.changes, again.existing),
+                        (again_counted.changes, again_counted.existing)
+                    );
+                }
+                (Err(full), Err(counted)) => assert_eq!(full, counted),
+                _ => panic!("modes disagree for {kind:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn counting_falls_back_when_the_core_edit_touches_the_sign_in_gate() {
+        // A sign-in gate match that overlaps the core edit is counted from the
+        // patched bytes, exactly as the full plan does.
+        let edit = 100;
+        let mut bytes = vec![0u8; 256];
+        assert!(!core_edit_touches_login(&bytes, &[edit], &[]));
+        assert!(core_edit_touches_login(&bytes, &[edit], &[edit + 4]));
+        assert!(core_edit_touches_login(&bytes, &[edit], &[edit - 19]));
+        assert!(!core_edit_touches_login(&bytes, &[edit], &[edit - 20]));
+        assert!(!core_edit_touches_login(&bytes, &[edit], &[edit + 8]));
+        bytes[edit..edit + 4].copy_from_slice(b"\x00\x00\x00\x00");
+        // An edit near the end of the section only looks at the bytes it has.
+        assert!(!core_edit_touches_login(&bytes, &[240], &[]));
+    }
+
+    #[test]
     fn macho_arm64_cli_patch_is_exact_and_idempotent() {
         // Exercise both supported instruction gaps and every TBZ immediate prefix.
         for branch in [0x03, 0x23, 0x43, 0x63, 0x83, 0xa3, 0xc3, 0xe3] {
@@ -1485,7 +1843,7 @@ mod tests {
                 let patched = plan_binary(&original, TargetKind::AgyCli).unwrap();
                 assert_eq!(patched.profile, "agy-arm64-v2");
                 assert_eq!((patched.changes, patched.existing), (2, 0));
-                let mut expected = original;
+                let mut expected = original.clone();
                 expected[512..520].copy_from_slice(b"\x23\x00\x80\x52\x03\x20\x00\x39");
                 let login = 512 + ARM64_LOGIN_OFFSET + CLI_GATE_ARM64_FIX_AT;
                 expected[login..login + 4].copy_from_slice(CLI_GATE_ARM64_FIX);
@@ -1502,13 +1860,13 @@ mod tests {
         let stock = arm64_cli_fixture(ARM64_CORE);
         let patched = plan_binary(&stock, TargetKind::AgyCli).unwrap();
         let login = 512 + ARM64_LOGIN_OFFSET;
-        for base in [&stock, &patched.data] {
+        for base in [&stock, &patched.data.to_vec()] {
             for (offset, length) in [(512, ARM64_CORE.len()), (login, ARM64_LOGIN.len())] {
                 let mut missing = base.clone();
                 missing[offset..offset + length].fill(0);
                 assert!(plan_binary(&missing, TargetKind::AgyCli).is_err());
             }
-            for source in [&stock, &patched.data] {
+            for source in [&stock, &patched.data.to_vec()] {
                 for (offset, length, copy) in [
                     (512, ARM64_CORE.len(), 512 + 32),
                     (login, ARM64_LOGIN.len(), login + 32),
@@ -1585,6 +1943,12 @@ mod tests {
         let stock = fs::read(path).unwrap();
         let patched = plan_binary(&stock, TargetKind::AgyCli).unwrap();
         assert_eq!((patched.changes, patched.existing), (2, 0));
+        let counted = plan_binary_mode(&stock, TargetKind::AgyCli, false, Mode::Count).unwrap();
+        assert_eq!(
+            (counted.changes, counted.existing),
+            (patched.changes, patched.existing)
+        );
+        assert!(matches!(counted.data, Cow::Borrowed(_)));
         let mut expected = stock.clone();
         let file = object::File::parse(stock.as_slice()).unwrap();
         for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
@@ -1632,7 +1996,7 @@ mod tests {
             }
             if migrate {
                 let signed =
-                    prepare_for_write(&target.path, legacy.data.clone(), target.kind).unwrap();
+                    prepare_for_write(&target.path, legacy.data.to_vec(), target.kind).unwrap();
                 journal::apply(&target.path, Some(&stock), &signed, "agy-arm64-v1").unwrap();
             }
             assert_eq!(
@@ -1662,7 +2026,8 @@ mod tests {
         let stock = arm64_cli_fixture(ARM64_CORE);
         let legacy = plan_binary_with_cli_profile(&stock, TargetKind::AgyCli, true)
             .unwrap()
-            .data;
+            .data
+            .into_owned();
         fs::write(&target.path, &stock).unwrap();
         journal::apply(&target.path, Some(&stock), &legacy, "agy-arm64-v1").unwrap();
         assert_eq!(check_target_state(&target), BinaryState::PartiallyPatched);
@@ -1683,7 +2048,8 @@ mod tests {
         let stock = arm64_cli_fixture(ARM64_CORE);
         let legacy = plan_binary_with_cli_profile(&stock, TargetKind::AgyCli, true)
             .unwrap()
-            .data;
+            .data
+            .into_owned();
         fs::write(&target.path, &legacy).unwrap();
         for backup in [None, Some(b"unrelated".as_slice())] {
             if let Some(bytes) = backup {
@@ -1710,7 +2076,8 @@ mod tests {
             let stock = arm64_cli_fixture(ARM64_CORE);
             let legacy = plan_binary_with_cli_profile(&stock, TargetKind::AgyCli, true)
                 .unwrap()
-                .data;
+                .data
+                .into_owned();
             fs::write(&target.path, &stock).unwrap();
             journal::apply(&target.path, Some(&stock), &legacy, "agy-arm64-v1").unwrap();
             let backup_dir = dir.path().join("agy.ag-backups");
@@ -1744,12 +2111,16 @@ mod tests {
             let stock = arm64_cli_fixture(ARM64_CORE);
             let legacy = plan_binary_with_cli_profile(&stock, TargetKind::AgyCli, true)
                 .unwrap()
-                .data;
+                .data
+                .into_owned();
             fs::write(&target.path, &stock).unwrap();
             journal::apply(&target.path, Some(&stock), &legacy, "agy-arm64-v1").unwrap();
             let mut baseline = stock;
             if interrupted {
-                let complete = plan_binary(&legacy, TargetKind::AgyCli).unwrap().data;
+                let complete = plan_binary(&legacy, TargetKind::AgyCli)
+                    .unwrap()
+                    .data
+                    .into_owned();
                 journal::apply_continuing(&target.path, &legacy, &complete, "agy-arm64-v2")
                     .unwrap();
                 // Journal was committed, but the executable replacement did not finish.
@@ -1853,9 +2224,11 @@ mod tests {
     fn binary_wildcards_match_linefeed_but_ambiguous_gates_are_rejected() {
         let bytes = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85\x00\x00\x00\x00";
         assert!(regex_cli_x64_long_orig().is_match(bytes));
-        let mut duplicate = [bytes.as_slice(), bytes.as_slice()].concat();
+        let mut duplicate: Cow<[u8]> = Cow::Owned([bytes.as_slice(), bytes.as_slice()].concat());
+        let whole = 0..duplicate.len();
         assert!(apply_pattern(
             &mut duplicate,
+            whole.clone(),
             regex_cli_x64_long_orig(),
             regex_cli_x64_long_patched(),
             CLI_GATE_X64_LONG_FIX,
@@ -1865,6 +2238,7 @@ mod tests {
         .is_err());
         let (changes, existing) = apply_pattern(
             &mut duplicate,
+            whole,
             regex_cli_x64_long_orig(),
             regex_cli_x64_long_patched(),
             CLI_GATE_X64_LONG_FIX,
@@ -1895,5 +2269,104 @@ mod tests {
             TargetKind::AgyCli
         )
         .is_err());
+    }
+
+    #[test]
+    fn read_only_checks_borrow_the_input_and_defer_the_digest() {
+        let code = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
+        let stock = pe_fixture(code, 0x8664);
+        let patched = plan_binary(&stock, TargetKind::LanguageServer).unwrap();
+        assert!(matches!(patched.data, Cow::Owned(_)));
+        let again = plan_binary(&patched.data, TargetKind::LanguageServer).unwrap();
+        assert_eq!((again.changes, again.existing), (0, 1));
+        assert!(matches!(again.data, Cow::Borrowed(_)));
+
+        let unsupported = pe_fixture(b"\x90\x90\x90\x90", 0x8664);
+        let error = plan_binary(&unsupported, TargetKind::LanguageServer)
+            .err()
+            .unwrap();
+        assert!(error.contains(DIGEST_PLACEHOLDER));
+        let digest = journal::digest(&unsupported);
+        assert!(with_digest(error, &unsupported).ends_with(&digest));
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = FoundTarget {
+            path: dir.path().join("language_server.exe"),
+            kind: TargetKind::LanguageServer,
+            name: "language_server".into(),
+        };
+        fs::write(&target.path, &unsupported).unwrap();
+        let reported = patch_target(&target).unwrap_err();
+        assert!(reported.ends_with(&digest), "{reported}");
+        assert_eq!(fs::read(&target.path).unwrap(), unsupported);
+    }
+
+    #[test]
+    fn cached_state_follows_a_replaced_file() {
+        fn stamp(path: &Path, seconds: u64) {
+            let at = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+            fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+        }
+        let code = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
+        let stock = pe_fixture(code, 0x8664);
+        let patched = plan_binary(&stock, TargetKind::LanguageServer)
+            .unwrap()
+            .data
+            .into_owned();
+        assert_eq!(stock.len(), patched.len());
+        let dir = tempfile::tempdir().unwrap();
+        let target = FoundTarget {
+            path: dir.path().join("language_server.exe"),
+            kind: TargetKind::LanguageServer,
+            name: "language_server".into(),
+        };
+        fs::write(&target.path, &stock).unwrap();
+        stamp(&target.path, 1_700_000_000);
+        assert_eq!(check_target_state(&target), BinaryState::Stock);
+        assert_eq!(check_target_state(&target), BinaryState::Stock);
+        fs::write(&target.path, &patched).unwrap();
+        stamp(&target.path, 1_700_000_001);
+        assert_eq!(check_target_state(&target), BinaryState::Patched);
+
+        // A failed read is not remembered for the unchanged file.
+        let missing = FoundTarget {
+            path: dir.path().join("absent.exe"),
+            kind: TargetKind::LanguageServer,
+            name: "absent".into(),
+        };
+        assert_eq!(check_target_state(&missing), BinaryState::Unknown);
+        assert!(STATES
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|cache| !cache.contains_key(&(missing.path.clone(), missing.kind))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_briefly_locked_file_is_read_again_on_the_next_refresh() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let code = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
+        let dir = tempfile::tempdir().unwrap();
+        let target = FoundTarget {
+            path: dir.path().join("language_server.exe"),
+            kind: TargetKind::LanguageServer,
+            name: "language_server".into(),
+        };
+        fs::write(&target.path, pe_fixture(code, 0x8664)).unwrap();
+        // Share mode 0 denies other readers, like an exclusive updater lock.
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&target.path)
+            .unwrap();
+        assert_eq!(check_target_state(&target), BinaryState::Unknown);
+        drop(lock);
+        assert_eq!(check_target_state(&target), BinaryState::Stock);
     }
 }

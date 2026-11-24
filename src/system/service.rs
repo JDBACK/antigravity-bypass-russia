@@ -119,6 +119,26 @@ mod windows_tests {
     }
 
     #[test]
+    fn maintenance_marker_holds_back_the_watchdog_only_while_fresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("maintenance");
+        assert!(!marker_fresh(&marker, std::time::Duration::from_secs(120)));
+        fs::write(&marker, b"setup").unwrap();
+        assert!(marker_fresh(&marker, std::time::Duration::from_secs(120)));
+        // A setup that crashed leaves an old marker: the watchdog resumes.
+        assert!(!marker_fresh(&marker, std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn task_xml_restarts_the_service_and_watches_it_every_five_minutes() {
+        let xml = windows_task_xml(Path::new(r"C:\ProgramData\x\ag_dns.exe"));
+        assert!(xml.contains("<Priority>5</Priority>"));
+        assert!(xml.contains("<Count>999</Count>"));
+        assert!(xml.contains("<Interval>PT5M</Interval>"));
+        assert!(xml.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"));
+    }
+
+    #[test]
     fn task_query_distinguishes_absence_from_scheduler_failure() {
         use std::os::windows::process::ExitStatusExt;
         for (text, code, expected) in [
@@ -212,9 +232,50 @@ fn registered_response(output: std::process::Output) -> Result<bool, String> {
     }))
 }
 
+/// Task Scheduler keeps every registered root task under TaskCache\Tree with
+/// its GUID in "Id"; a folder of the same name has no "Id". Reading it avoids
+/// listing every task on the system with `schtasks /Query`.
+#[cfg(windows)]
+fn registered_in_task_cache() -> Option<bool> {
+    root_task_in_cache(TASK_NAME)
+}
+
+#[cfg(windows)]
+fn root_task_in_cache(name: &str) -> Option<bool> {
+    use windows_sys::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_ANY, RRF_SUBKEY_WOW6464KEY,
+    };
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let key = wide(&format!(
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\{name}"
+    ));
+    let value = wide("Id");
+    let code = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_ANY | RRF_SUBKEY_WOW6464KEY,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    match code {
+        0 => Some(true),
+        ERROR_FILE_NOT_FOUND => Some(false),
+        // Access denied or an unexpected state: ask the scheduler itself.
+        _ => None,
+    }
+}
+
 pub fn registered_state() -> Result<bool, String> {
     #[cfg(windows)]
     {
+        if let Some(registered) = registered_in_task_cache() {
+            return Ok(registered);
+        }
         registered_response(
             crate::system::command::output("schtasks", ["/Query", "/FO", "CSV", "/NH"])
                 .map_err(|e| format!("Проверка задачи DNS-службы: {e}"))?,
@@ -237,32 +298,8 @@ pub fn registered_state() -> Result<bool, String> {
 pub fn running_state() -> Result<bool, String> {
     #[cfg(windows)]
     {
-        let out = crate::system::command::output(
-            "tasklist",
-            [
-                "/FI",
-                &format!("IMAGENAME eq {}", EXE_NAME),
-                "/FO",
-                "CSV",
-                "/NH",
-            ],
-        )
-        .map_err(|e| format!("Проверка процесса DNS-службы: {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "Не удалось проверить процесс DNS-службы ({}): {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).lines().any(|line| {
-            line.split(',')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .trim_matches('"')
-                .eq_ignore_ascii_case(EXE_NAME)
-        }))
+        crate::system::process::image_running_at(EXE_NAME, &installed_exe())
+            .map_err(|e| format!("Проверка процесса DNS-службы: {e}"))
     }
     #[cfg(target_os = "linux")]
     return linux_worker_pids().map(|pids| !pids.is_empty());
@@ -346,7 +383,14 @@ fn stop_worker() -> Result<(), String> {
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    // The relay's route helpers run as child processes; stop them with it.
+    #[cfg(windows)]
+    crate::system::process::terminate_image_tree(
+        EXE_NAME,
+        Some(&installed_exe()),
+        std::time::Duration::from_secs(2),
+    )?;
+    #[cfg(target_os = "macos")]
     crate::system::process::stop_process_by_name(EXE_NAME);
     Ok(())
 }
@@ -366,6 +410,14 @@ fn windows_task_xml(dst: &Path) -> String {
     <LogonTrigger>
       <Enabled>true</Enabled>
     </LogonTrigger>
+    <TimeTrigger>
+      <Repetition>
+        <Interval>PT5M</Interval>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+      <StartBoundary>2024-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>
   </Triggers>
   <Principals>
     <Principal id="Author">
@@ -390,10 +442,10 @@ fn windows_task_xml(dst: &Path) -> String {
     <RunOnlyIfIdle>false</RunOnlyIfIdle>
     <WakeToRun>false</WakeToRun>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
+    <Priority>5</Priority>
     <RestartOnFailure>
       <Interval>PT1M</Interval>
-      <Count>3</Count>
+      <Count>999</Count>
     </RestartOnFailure>
   </Settings>
   <Actions Context="Author">
@@ -520,7 +572,150 @@ mod binary_update_tests {
     }
 }
 
-pub fn enable() -> Result<(), String> {
+/// Preserve an installed relay across a failed replacement. Reusing the
+/// existing registration also preserves its settings and startup policy.
+pub struct RelayBackup {
+    pub registered: bool,
+    running: bool,
+    binary: Option<Vec<u8>>,
+}
+
+impl RelayBackup {
+    pub fn capture() -> Result<Self, String> {
+        let registered = registered_state()?;
+        let running = running_state()?;
+        let binary = match fs::read(installed_exe()) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !running => None,
+            Err(error) => return Err(format!("Не удалось сохранить бинарник DNS-службы: {error}")),
+        };
+        #[cfg(target_os = "macos")]
+        if registered && !Path::new(LAUNCHD_PLIST).is_file() {
+            return Err("Не найден plist работающей DNS-службы".into());
+        }
+        Ok(Self {
+            registered,
+            running,
+            binary,
+        })
+    }
+
+    pub fn stop_replacement(&self) -> Result<(), String> {
+        if !self.registered {
+            return disable();
+        }
+        #[cfg(windows)]
+        return stop_windows_worker();
+        #[cfg(target_os = "macos")]
+        return unload_mac_job();
+        #[cfg(target_os = "linux")]
+        return linux_systemctl(&["stop", SYSTEMD_LABEL]);
+    }
+
+    pub fn restore(self) -> Result<(), String> {
+        restore_relay_binary(&installed_exe(), self.binary.as_deref())?;
+        if self.running {
+            #[cfg(target_os = "macos")]
+            load_mac_job()?;
+            #[cfg(not(target_os = "macos"))]
+            start()?;
+            if !crate::net::wait_for_ready(
+                std::time::Duration::from_secs(4),
+                crate::net::relay_ready,
+            ) {
+                return Err("Прежняя DNS-служба не подтвердила готовность после запуска".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+fn restore_relay_binary(dst: &Path, original: Option<&[u8]>) -> Result<(), String> {
+    match original {
+        Some(bytes) if fs::read(dst).ok().as_deref() != Some(bytes) => {
+            let staged = crate::system::fs_utils::prepared_file(dst, bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                staged
+                    .as_file()
+                    .set_permissions(fs::Permissions::from_mode(0o755))
+                    .map_err(|e| e.to_string())?;
+            }
+            staged
+                .persist(dst)
+                .map_err(|e| format!("Не удалось вернуть бинарник DNS-службы: {e}"))?;
+        }
+        None => match fs::remove_file(dst) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Не удалось убрать новый бинарник DNS-службы: {error}"
+                ))
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+#[test]
+fn relay_binary_backup_can_restore_or_remove_the_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let installed = dir.path().join(EXE_NAME);
+    fs::write(&installed, b"replacement").unwrap();
+    restore_relay_binary(&installed, Some(b"original")).unwrap();
+    assert_eq!(fs::read(&installed).unwrap(), b"original");
+    restore_relay_binary(&installed, None).unwrap();
+    restore_relay_binary(&installed, None).unwrap();
+    assert!(!installed.exists());
+}
+
+/// While setup stops, replaces and restarts the service, the task's
+/// five-minute watchdog trigger must not start the old binary in between.
+/// The marker goes stale after two minutes, so a setup that crashed does not
+/// keep the service down.
+#[cfg(windows)]
+const MAINTENANCE_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[cfg(windows)]
+fn maintenance_marker() -> PathBuf {
+    install_dir().join("maintenance")
+}
+
+/// True while setup is updating the service; a watchdog start then exits.
+#[cfg(windows)]
+pub fn maintenance_active() -> bool {
+    marker_fresh(&maintenance_marker(), MAINTENANCE_LIMIT)
+}
+
+#[cfg(windows)]
+fn marker_fresh(path: &Path, limit: std::time::Duration) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .is_ok_and(|modified| modified.elapsed().is_ok_and(|age| age < limit))
+}
+
+#[cfg(windows)]
+struct Maintenance;
+
+#[cfg(windows)]
+impl Maintenance {
+    fn begin() -> Self {
+        let _ = fs::write(maintenance_marker(), b"setup\n");
+        Self
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Maintenance {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(maintenance_marker());
+    }
+}
+
+pub fn enable(reuse_registration: bool, replacement_attempted: &mut bool) -> Result<(), String> {
     let dir = install_dir();
     fs::create_dir_all(&dir).map_err(|e| {
         format!(
@@ -530,6 +725,8 @@ pub fn enable() -> Result<(), String> {
         )
     })?;
 
+    #[cfg(windows)]
+    let maintenance = Maintenance::begin();
     let src = std::env::current_exe()
         .map_err(|e| format!("Не удалось определить путь к текущему exe: {}", e))?;
     let dst = installed_exe();
@@ -537,11 +734,10 @@ pub fn enable() -> Result<(), String> {
     if !dst.exists() || !same_file_bytes(&src, &dst) {
         let staged = prepare_service_binary(&src, &dst)?;
         finish_prepared_service_binary(&staged)?;
+        *replacement_attempted = true;
+        // RestartOnFailure is set: end the task before stop_worker kills it.
         #[cfg(target_os = "windows")]
-        {
-            let _ = crate::system::command::output("schtasks", ["/End", "/TN", TASK_NAME]);
-            let _ = crate::system::command::output("taskkill", ["/F", "/T", "/IM", EXE_NAME]);
-        }
+        let _ = crate::system::command::output("schtasks", ["/End", "/TN", TASK_NAME]);
         #[cfg(target_os = "macos")]
         {
             unload_mac_job()?;
@@ -557,7 +753,6 @@ pub fn enable() -> Result<(), String> {
 
         let mut copy_res = Err(std::io::Error::new(std::io::ErrorKind::Other, "init"));
         for attempt in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
             // Rename on the same filesystem replaces the old binary atomically.
             // A failed attempt keeps both the old binary and the staged copy.
             copy_res = fs::rename(&staged, &dst);
@@ -566,13 +761,11 @@ pub fn enable() -> Result<(), String> {
             }
             if attempt % 5 == 0 {
                 #[cfg(target_os = "windows")]
-                {
-                    let _ = crate::system::command::output("schtasks", ["/End", "/TN", TASK_NAME]);
-                    let _ =
-                        crate::system::command::output("taskkill", ["/F", "/T", "/IM", EXE_NAME]);
-                }
+                let _ = crate::system::command::output("schtasks", ["/End", "/TN", TASK_NAME]);
                 stop_worker()?;
             }
+            // stop_worker waits for exit; the image file can stay locked briefly.
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
         copy_res.map_err(|e| {
@@ -585,12 +778,18 @@ pub fn enable() -> Result<(), String> {
         })?;
     }
 
+    *replacement_attempted = true;
     #[cfg(target_os = "windows")]
     {
         // A worker is a separate process: updating iface.conf/network-user.json
         // cannot invalidate its in-memory caches. Restart on every successful
         // setup, including when the executable bytes have not changed.
         stop_windows_worker()?;
+        if reuse_registration {
+            // The service started now must not see the marker and exit.
+            drop(maintenance);
+            return start();
+        }
         let task_xml = windows_task_xml(&dst);
 
         let xml_path = dir.join("task.xml");
@@ -624,6 +823,7 @@ pub fn enable() -> Result<(), String> {
             return Err(format!("schtasks /Create завершился ошибкой: {}", err));
         }
 
+        drop(maintenance);
         let started = crate::system::command::output("schtasks", ["/Run", "/TN", TASK_NAME])
             .map_err(|e| format!("Запуск DNS-службы: {e}"))?;
         if !started.status.success() {
@@ -639,6 +839,9 @@ pub fn enable() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         unload_mac_job()?;
+        if reuse_registration {
+            return load_mac_job();
+        }
         let plist_path = LAUNCHD_PLIST;
         let stderr_log = dir.join("stderr.log");
         let stdout_log = dir.join("stdout.log");
@@ -702,14 +905,7 @@ pub fn enable() -> Result<(), String> {
             }
         }
 
-        let out = crate::system::command::output("launchctl", ["bootstrap", "system", plist_path]);
-        if out.map(|o| !o.status.success()).unwrap_or(true) {
-            let fallback = crate::system::command::output("launchctl", ["load", "-w", plist_path])
-                .map_err(|e| format!("launchctl load failed: {}", e))?;
-            if !fallback.status.success() {
-                return Err("Не удалось загрузить LaunchDaemon через launchctl".to_string());
-            }
-        }
+        load_mac_job()?;
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -732,6 +928,9 @@ pub fn enable() -> Result<(), String> {
         );
 
         if linux_has_systemd() {
+            if reuse_registration {
+                return linux_systemctl(&["restart", SYSTEMD_LABEL]);
+            }
             crate::system::fs_utils::robust_write_file(
                 Path::new(SYSTEMD_SERVICE),
                 unit_content.as_bytes(),
@@ -747,6 +946,22 @@ pub fn enable() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn load_mac_job() -> Result<(), String> {
+    if crate::system::command::output("launchctl", ["bootstrap", "system", LAUNCHD_PLIST])
+        .is_ok_and(|out| out.status.success())
+    {
+        return Ok(());
+    }
+    let fallback = crate::system::command::output("launchctl", ["load", "-w", LAUNCHD_PLIST])
+        .map_err(|e| format!("launchctl load failed: {e}"))?;
+    if fallback.status.success() {
+        Ok(())
+    } else {
+        Err("Не удалось загрузить LaunchDaemon через launchctl".into())
+    }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -852,7 +1067,6 @@ pub fn disable() -> Result<(), String> {
     {
         let _ = crate::system::command::output("schtasks", ["/End", "/TN", TASK_NAME]);
         let _ = crate::system::command::output("schtasks", ["/Delete", "/TN", TASK_NAME, "/F"]);
-        let _ = crate::system::command::output("taskkill", ["/F", "/T", "/IM", EXE_NAME]);
     }
     #[cfg(target_os = "macos")]
     {

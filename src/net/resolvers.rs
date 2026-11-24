@@ -8,28 +8,31 @@ use super::{
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub struct Provider {
-    pub name: &'static str,
-    pub v4: &'static [&'static str],
-}
-
-pub const PROVIDERS: &[Provider] = &[Provider {
-    name: "geohide.ru",
-    v4: &["45.155.204.190", "37.230.192.51"],
-}];
-
 const REFERENCE_V4: &[&str] = &["8.8.8.8", "1.1.1.1"];
 const REFERENCE_STUBS: [Ipv4Addr; 2] = [Ipv4Addr::new(8, 6, 112, 0), Ipv4Addr::new(8, 47, 69, 0)];
+// Reference answers only tell which Google netblocks a name normally uses.
+// Reuse them for a while instead of asking both public resolvers on every miss.
+const REFERENCE_TTL_ANSWER: Duration = Duration::from_secs(300);
+const REFERENCE_TTL_FAILURE: Duration = Duration::from_secs(30);
+type ReferenceKey = (String, u16, Ipv4Addr);
+struct ReferenceEntry {
+    addrs: Option<Vec<IpAddr>>,
+    at: Instant,
+    generation: u64,
+}
+static REFERENCES: Mutex<Option<HashMap<ReferenceKey, ReferenceEntry>>> = Mutex::new(None);
 
 const LIVENESS_PORT: u16 = 443;
 const LIVENESS_BUDGET: Duration = Duration::from_millis(250);
 const LIVENESS_TTL_ALIVE: Duration = Duration::from_secs(600);
 const LIVENESS_TTL_DEAD: Duration = Duration::from_secs(60);
 static LIVENESS: Mutex<Option<HashMap<IpAddr, (bool, Instant)>>> = Mutex::new(None);
+static NETWORK_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 const CACHE_CAPACITY: usize = 1024;
 // An expired answer is served at once with a short TTL while one refresh runs.
@@ -53,17 +56,15 @@ pub struct ResolveHit {
 }
 
 pub fn all_provider_v4() -> Vec<String> {
-    resolver_pool::load()
-        .unwrap_or_default()
-        .iter()
-        .flat_map(|p| p.udp_addresses().iter().map(ToString::to_string))
-        .collect()
+    configured_udp_v4(&resolver_pool::load().unwrap_or_default())
 }
-pub fn fallback_v4() -> Vec<String> {
-    resolver_pool::load()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|p| p.udp_addresses().first().map(ToString::to_string))
+
+pub(super) fn configured_udp_v4(pool: &[ActiveProvider]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    pool.iter()
+        .flat_map(|p| p.udp_addresses())
+        .filter(|ip| seen.insert(**ip))
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -71,8 +72,9 @@ pub fn fallback_v4() -> Vec<String> {
 // Changing/disabling an endpoint cannot reuse an answer from the previous configuration.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct CacheKey {
-    pool: String,
+    pool: Arc<str>,
     interface: u32,
+    network_generation: u64,
     question: Vec<u8>,
 }
 struct Cached {
@@ -80,15 +82,27 @@ struct Cached {
     provider: String,
     verdict: Verdict,
     at: Instant,
+    /// A refresh before expiry was already started for this answer.
+    prefetching: bool,
 }
 static PACKETS: Mutex<Option<HashMap<CacheKey, Cached>>> = Mutex::new(None);
 // Identical concurrent questions share one upstream race.
 type Flight = Arc<(Mutex<Option<Option<ResolveHit>>>, Condvar)>;
 static IN_FLIGHT: Mutex<Option<HashMap<CacheKey, Flight>>> = Mutex::new(None);
+#[cfg(test)]
 fn cache_key(pool: &[ActiveProvider], query: &[u8], interface: u32) -> CacheKey {
-    CacheKey {
-        pool: format!("{pool:?}"),
+    snapshot_key(
+        &resolver_pool::Snapshot::new(pool.to_vec()),
+        query,
         interface,
+    )
+}
+
+fn snapshot_key(pool: &resolver_pool::Snapshot, query: &[u8], interface: u32) -> CacheKey {
+    CacheKey {
+        pool: Arc::clone(&pool.fingerprint),
+        interface,
+        network_generation: NETWORK_GENERATION.load(Ordering::Acquire),
         question: query.get(2..).unwrap_or_default().to_vec(),
     }
 }
@@ -148,39 +162,130 @@ pub fn classify(candidate: &[IpAddr], reference: &[IpAddr], proxy: &[IpAddr]) ->
 
 /// TLS-ok IPv4s, fastest first. TCP-open is not enough: a proxy can accept
 /// SYN and still RST or stall the handshake.
+#[cfg(windows)]
 pub fn rank_tls_v4(addrs: &[IpAddr], sni: &str) -> Vec<(Ipv4Addr, u128)> {
+    rank_tls_v4_report(addrs, sni).0
+}
+
+/// Verified addresses sorted by latency, plus the probe error of every
+/// address that failed. The errors explain an empty result to the user.
+/// Lookup threads that wait a minute after their work for the next lookup,
+/// instead of a new thread for every upstream question. Without an idle
+/// thread this behaves like `thread::spawn`.
+mod reuse {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    type Task = Box<dyn FnOnce() + Send>;
+
+    struct Idle {
+        id: u64,
+        sender: mpsc::Sender<Task>,
+    }
+
+    static IDLE: Mutex<Vec<Idle>> = Mutex::new(Vec::new());
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+    pub(super) const KEEP: Duration = Duration::from_secs(60);
+    const MAX_IDLE: usize = 16;
+
+    fn idle() -> std::sync::MutexGuard<'static, Vec<Idle>> {
+        IDLE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) fn run(task: impl FnOnce() + Send + 'static) {
+        let mut task: Task = Box::new(task);
+        loop {
+            let Some(worker) = idle().pop() else {
+                break;
+            };
+            match worker.sender.send(task) {
+                Ok(()) => return,
+                // The worker exited between being listed and taking the task.
+                Err(mpsc::SendError(back)) => task = back,
+            }
+        }
+        thread::spawn(move || work(task, KEEP));
+    }
+
+    pub(super) fn work(first: Task, keep: Duration) {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let (sender, tasks) = mpsc::channel();
+        let mut task = first;
+        loop {
+            task();
+            {
+                let mut idle = idle();
+                if idle.len() >= MAX_IDLE {
+                    return;
+                }
+                idle.push(Idle {
+                    id,
+                    sender: sender.clone(),
+                });
+            }
+            task = match tasks.recv_timeout(keep) {
+                Ok(next) => next,
+                Err(_) => {
+                    let mut idle = idle();
+                    match idle.iter().position(|worker| worker.id == id) {
+                        Some(position) => {
+                            idle.remove(position);
+                            return;
+                        }
+                        // Taken just as the wait ended: its task is on the way.
+                        None => {
+                            drop(idle);
+                            match tasks.recv() {
+                                Ok(next) => next,
+                                Err(_) => return,
+                            }
+                        }
+                    }
+                }
+            };
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn idle_count() -> usize {
+        idle().len()
+    }
+}
+
+pub fn rank_tls_v4_report(addrs: &[IpAddr], sni: &str) -> (Vec<(Ipv4Addr, u128)>, Vec<String>) {
     let candidates: Vec<IpAddr> = addrs.iter().copied().filter(|a| a.is_ipv4()).collect();
     if candidates.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let (tx, rx) = mpsc::channel();
     for addr in candidates {
         let sni = sni.to_string();
         let tx = tx.clone();
         thread::spawn(move || {
-            let _ = tx.send((addr, verified_latency(SocketAddr::new(addr, 443), &sni)));
+            let _ = tx.send((
+                addr,
+                super::health::probe_ip(SocketAddr::new(addr, 443), &sni),
+            ));
         });
     }
     drop(tx);
     let mut out = Vec::new();
-    while let Ok((addr, ms)) = rx.recv() {
-        let Some(ms) = ms else {
-            continue;
-        };
-        let IpAddr::V4(v4) = addr else {
-            continue;
-        };
-        out.push((v4, ms));
+    let mut errors = Vec::new();
+    while let Ok((addr, result)) = rx.recv() {
+        match (addr, result) {
+            (IpAddr::V4(v4), Ok(ms)) => out.push((v4, ms)),
+            (_, Err(error)) => errors.push(error),
+            _ => {}
+        }
     }
     out.sort_by_key(|(_, ms)| *ms);
-    out
-}
-
-fn verified_latency(addr: SocketAddr, sni: &str) -> Option<u128> {
-    super::health::probe_ip(addr, sni).ok()
+    (out, errors)
 }
 
 fn is_alive(addr: IpAddr) -> bool {
+    let generation = NETWORK_GENERATION.load(Ordering::Acquire);
     if let Ok(guard) = LIVENESS.lock() {
         if let Some(map) = guard.as_ref() {
             if let Some((ok, at)) = map.get(&addr) {
@@ -199,8 +304,10 @@ fn is_alive(addr: IpAddr) -> bool {
     let sock = SocketAddr::new(addr, LIVENESS_PORT);
     let ok = TcpStream::connect_timeout(&sock, LIVENESS_BUDGET).is_ok();
     if let Ok(mut guard) = LIVENESS.lock() {
-        let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(addr, (ok, Instant::now()));
+        if generation == NETWORK_GENERATION.load(Ordering::Acquire) {
+            let map = guard.get_or_insert_with(HashMap::new);
+            map.insert(addr, (ok, Instant::now()));
+        }
     }
     ok
 }
@@ -372,6 +479,66 @@ fn collect_race_with(
     (hits, reference)
 }
 
+fn reference_question(query: &[u8]) -> Option<(String, u16)> {
+    Some((
+        question_name(query)?.to_ascii_lowercase(),
+        question_type(query)?,
+    ))
+}
+
+/// Addresses from every reference resolver, if all of them have a fresh entry
+/// (an answer or a recent failure) for this question.
+fn cached_references(question: &(String, u16)) -> Option<Vec<IpAddr>> {
+    let generation = NETWORK_GENERATION.load(Ordering::Acquire);
+    let guard = REFERENCES.lock().ok()?;
+    let cache = guard.as_ref()?;
+    let mut merged = Vec::new();
+    for ns in REFERENCE_V4 {
+        let key = (question.0.clone(), question.1, ns.parse().ok()?);
+        let entry = cache.get(&key)?;
+        let ttl = if entry.addrs.is_some() {
+            REFERENCE_TTL_ANSWER
+        } else {
+            REFERENCE_TTL_FAILURE
+        };
+        if entry.generation != generation || entry.at.elapsed() >= ttl {
+            return None;
+        }
+        for addr in entry.addrs.iter().flatten() {
+            if !merged.contains(addr) {
+                merged.push(*addr);
+            }
+        }
+    }
+    Some(merged)
+}
+
+fn remember_reference(
+    question: (String, u16),
+    server: Ipv4Addr,
+    addrs: Option<Vec<IpAddr>>,
+    generation: u64,
+) {
+    let Ok(mut guard) = REFERENCES.lock() else {
+        return;
+    };
+    if generation != NETWORK_GENERATION.load(Ordering::Acquire) {
+        return;
+    }
+    let cache = guard.get_or_insert_with(HashMap::new);
+    if cache.len() >= CACHE_CAPACITY {
+        cache.clear();
+    }
+    cache.insert(
+        (question.0, question.1, server),
+        ReferenceEntry {
+            addrs,
+            at: Instant::now(),
+            generation,
+        },
+    );
+}
+
 fn race_providers(
     pool: &[ActiveProvider],
     query: &[u8],
@@ -383,7 +550,7 @@ fn race_providers(
     for (idx, provider) in pool.iter().cloned().enumerate() {
         let query = query.to_vec();
         let tx = tx.clone();
-        thread::spawn(move || {
+        reuse::run(move || {
             if let Some((reply, server)) = provider.query(&query, interface) {
                 if is_successful_response(&reply) {
                     let addrs = answer_addrs(&reply);
@@ -398,21 +565,34 @@ fn race_providers(
             let _ = tx.send(RaceMsg::Done(idx));
         });
     }
-    for ns in REFERENCE_V4 {
-        let query = query.to_vec();
-        let tx = tx.clone();
-        let ip = ns.parse().unwrap();
-        thread::spawn(move || {
-            if let Ok(reply) = query_raw_via(&query, ip, 0, resolver_pool::UDP_TIMEOUT) {
-                if is_successful_response(&reply) {
-                    let addrs = answer_addrs(&reply)
+    let question = reference_question(query);
+    if let Some(addrs) = question.as_ref().and_then(cached_references) {
+        let _ = tx.send(RaceMsg::Reference(addrs));
+    } else {
+        let generation = NETWORK_GENERATION.load(Ordering::Acquire);
+        for ns in REFERENCE_V4 {
+            let query = query.to_vec();
+            let tx = tx.clone();
+            let question = question.clone();
+            let ip = ns.parse().unwrap();
+            reuse::run(move || {
+                let reply = query_raw_via(&query, ip, 0, resolver_pool::UDP_TIMEOUT)
+                    .ok()
+                    .filter(|reply| is_successful_response(reply));
+                let addrs = reply.map(|reply| {
+                    answer_addrs(&reply)
                         .into_iter()
                         .filter(|a| !matches!(a, IpAddr::V4(ip) if REFERENCE_STUBS.contains(ip)))
-                        .collect();
+                        .collect::<Vec<_>>()
+                });
+                if let Some(question) = question {
+                    remember_reference(question, ip, addrs.clone(), generation);
+                }
+                if let Some(addrs) = addrs {
                     let _ = tx.send(RaceMsg::Reference(addrs));
                 }
-            }
-        });
+            });
+        }
     }
     drop(tx);
     let settle = early.then(|| Settle {
@@ -440,18 +620,35 @@ fn pick_winner(hits: &[RaceResult], reference: &[IpAddr]) -> Option<usize> {
 
 enum Lookup {
     Fresh(ResolveHit),
+    /// Still valid, but less than a fifth of its lifetime is left: answer from
+    /// the cache and refresh it now, so popular names rarely reach expiry.
+    Expiring(ResolveHit),
     Stale(ResolveHit),
     Miss,
 }
 
 fn cached(key: &CacheKey) -> Lookup {
-    let Ok(guard) = PACKETS.lock() else {
+    let Ok(mut guard) = PACKETS.lock() else {
         return Lookup::Miss;
     };
-    let Some(entry) = guard.as_ref().and_then(|c| c.get(key)) else {
+    let Some(entry) = guard.as_mut().and_then(|c| c.get_mut(key)) else {
         return Lookup::Miss;
     };
-    cached_answer(entry, entry.at.elapsed())
+    let age = entry.at.elapsed();
+    match cached_answer(entry, age) {
+        // One early refresh per answer: a failed one leaves the stale path.
+        Lookup::Fresh(hit) if !entry.prefetching && expiring_soon(&entry.reply, age) => {
+            entry.prefetching = true;
+            Lookup::Expiring(hit)
+        }
+        lookup => lookup,
+    }
+}
+
+/// Less than a fifth of the answer's lifetime is left.
+fn expiring_soon(reply: &[u8], age: Duration) -> bool {
+    let age = age.as_secs() as u32;
+    super::client::aged_reply(reply, age + age / 4 + 1).is_none()
 }
 
 fn cached_answer(entry: &Cached, age: Duration) -> Lookup {
@@ -475,6 +672,9 @@ fn remember(key: CacheKey, hit: &ResolveHit) {
     let Ok(mut guard) = PACKETS.lock() else {
         return;
     };
+    if key.network_generation != NETWORK_GENERATION.load(Ordering::Acquire) {
+        return;
+    }
     let cache = guard.get_or_insert_with(HashMap::new);
     if cache.len() >= CACHE_CAPACITY && !cache.contains_key(&key) {
         let oldest = cache
@@ -492,6 +692,7 @@ fn remember(key: CacheKey, hit: &ResolveHit) {
             provider: hit.provider.clone(),
             verdict: hit.verdict,
             at: Instant::now(),
+            prefetching: false,
         },
     );
 }
@@ -505,25 +706,33 @@ fn with_id(mut hit: ResolveHit, query: &[u8]) -> ResolveHit {
 
 pub fn resolve_best(query: &[u8], interface: u32) -> Option<ResolveHit> {
     question_name(query)?;
-    let pool = resolver_pool::load().ok()?;
-    let key = cache_key(&pool, query, interface);
+    let pool = resolver_pool::load_shared().ok()?;
+    let key = snapshot_key(&pool, query, interface);
     match cached(&key) {
         Lookup::Fresh(hit) => return Some(with_id(hit, query)),
-        Lookup::Stale(hit) => {
+        Lookup::Expiring(hit) | Lookup::Stale(hit) => {
             refresh_in_background(pool, query.to_vec(), interface, key);
             return Some(with_id(hit, query));
         }
         Lookup::Miss => {}
     }
-    shared(key, || resolve_uncached(&pool, query, interface)).map(|hit| with_id(hit, query))
+    shared(key, || resolve_uncached(&pool.providers, query, interface))
+        .map(|hit| with_id(hit, query))
 }
 
-fn refresh_in_background(pool: Vec<ActiveProvider>, query: Vec<u8>, interface: u32, key: CacheKey) {
+fn refresh_in_background(
+    pool: Arc<resolver_pool::Snapshot>,
+    query: Vec<u8>,
+    interface: u32,
+    key: CacheKey,
+) {
     let running = IN_FLIGHT
         .lock()
         .is_ok_and(|guard| guard.as_ref().is_some_and(|f| f.contains_key(&key)));
     if !running {
-        thread::spawn(move || shared(key, || resolve_uncached(&pool, &query, interface)));
+        reuse::run(move || {
+            shared(key, || resolve_uncached(&pool.providers, &query, interface));
+        });
     }
 }
 
@@ -583,22 +792,40 @@ fn resolve_uncached(pool: &[ActiveProvider], query: &[u8], interface: u32) -> Op
 
 /// Only UDP addresses belong in NRPT/resolver files. DoH is served by the local worker.
 pub fn substituting_addrs(name: &str, interface: u32) -> Vec<String> {
-    let Ok(pool) = resolver_pool::load() else {
+    let Ok(mut pool) = resolver_pool::load() else {
         return vec![];
     };
+    pool.retain(|provider| !provider.udp_addresses().is_empty());
+    if pool.is_empty() {
+        return vec![];
+    }
     let (hits, reference) = race_providers(&pool, &build_query(name, 0x5355), interface, false);
-    let mut ips = Vec::new();
+    substituting_udp_servers(&pool, &hits, &reference)
+}
+
+fn substituting_udp_servers(
+    pool: &[ActiveProvider],
+    hits: &[RaceResult],
+    reference: &[IpAddr],
+) -> Vec<String> {
+    let mut confirmed = Vec::new();
+    let mut backups = Vec::new();
     for hit in hits {
-        if classify(&hit.addrs, &reference, &[]) == Verdict::Substituted {
-            // Use the endpoint that actually answered, never a DoH bootstrap IP.
-            if let Some(ip) = hit.server {
-                if !ips.contains(&ip.to_string()) {
-                    ips.push(ip.to_string());
-                }
+        if let Some(server) = hit.server {
+            if classify(&hit.addrs, reference, &[]) == Verdict::Substituted {
+                confirmed.push(server);
+                backups.extend_from_slice(pool[hit.idx].udp_addresses());
             }
         }
     }
-    ips
+    // Try every confirmed server before any sibling which has not answered.
+    let mut seen = std::collections::HashSet::new();
+    confirmed
+        .into_iter()
+        .chain(backups)
+        .filter(|ip| seen.insert(*ip))
+        .map(|ip| ip.to_string())
+        .collect()
 }
 
 #[derive(serde::Serialize)]
@@ -644,26 +871,47 @@ pub fn capabilities(interface: u32) -> Result<Vec<Capability>, String> {
             names.push(name);
         }
     }
-    for name in names {
-        let host = name.trim_start_matches('.');
-        let (hits, reference) = race_providers(&pool, &build_query(host, 0x4341), interface, false);
-        for (idx, provider) in pool.iter().enumerate() {
-            let hit = hits.iter().find(|h| h.idx == idx);
-            out.push(Capability {
-                provider: idx + 1,
-                transport: provider.kind(),
-                host: host.into(),
-                status: hit
-                    .map(|h| {
-                        if h.addrs.is_empty() {
-                            "no_addresses"
-                        } else {
-                            verdict_tag(classify(&h.addrs, &reference, &[]))
-                        }
+    // Sequential timeouts for seven names could exhaust the entire report's
+    // 20-second deadline and hide even the providers which did answer.
+    for batch in names.chunks(3) {
+        let results = thread::scope(|scope| {
+            let workers: Vec<_> = batch
+                .iter()
+                .map(|name| {
+                    let host = name.trim_start_matches('.');
+                    let pool = &pool;
+                    scope.spawn(move || {
+                        (
+                            host,
+                            race_providers(pool, &build_query(host, 0x4341), interface, false),
+                        )
                     })
-                    .unwrap_or("timeout_or_error"),
-                addresses: hit.map(|h| h.addrs.clone()).unwrap_or_default(),
-            });
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().map_err(|_| "Ошибка проверки DNS".to_string()))
+                .collect::<Result<Vec<_>, _>>()
+        })?;
+        for (host, (hits, reference)) in results {
+            for (idx, provider) in pool.iter().enumerate() {
+                let hit = hits.iter().find(|h| h.idx == idx);
+                out.push(Capability {
+                    provider: idx + 1,
+                    transport: provider.kind(),
+                    host: host.into(),
+                    status: hit
+                        .map(|h| {
+                            if h.addrs.is_empty() {
+                                "no_addresses"
+                            } else {
+                                verdict_tag(classify(&h.addrs, &reference, &[]))
+                            }
+                        })
+                        .unwrap_or("timeout_or_error"),
+                    addresses: hit.map(|h| h.addrs.clone()).unwrap_or_default(),
+                });
+            }
         }
     }
     Ok(out)
@@ -678,10 +926,15 @@ pub fn verdict_tag(v: Verdict) -> &'static str {
     }
 }
 pub fn invalidate_network_caches() {
+    super::dns_https::invalidate_connections();
+    NETWORK_GENERATION.fetch_add(1, Ordering::AcqRel);
     if let Ok(mut cache) = PACKETS.lock() {
         *cache = None;
     }
     if let Ok(mut cache) = LIVENESS.lock() {
+        *cache = None;
+    }
+    if let Ok(mut cache) = REFERENCES.lock() {
         *cache = None;
     }
 }
@@ -689,8 +942,68 @@ pub fn invalidate_network_caches() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reference_answers_are_reused_only_while_both_resolvers_are_fresh() {
+        // Another test changes the network generation; run apart from it.
+        let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let question = ("reference-cache.example".to_string(), 1);
+        let google: Ipv4Addr = "8.8.8.8".parse().unwrap();
+        let cloudflare: Ipv4Addr = "1.1.1.1".parse().unwrap();
+        let generation = NETWORK_GENERATION.load(Ordering::Acquire);
+        remember_reference(
+            question.clone(),
+            google,
+            Some(vec![v4(142, 250, 1, 1)]),
+            generation,
+        );
+        assert_eq!(cached_references(&question), None);
+        remember_reference(question.clone(), cloudflare, None, generation);
+        assert_eq!(cached_references(&question), Some(vec![v4(142, 250, 1, 1)]));
+        remember_reference(
+            question.clone(),
+            cloudflare,
+            Some(vec![v4(142, 250, 1, 1), v4(172, 217, 2, 2)]),
+            generation,
+        );
+        assert_eq!(
+            cached_references(&question),
+            Some(vec![v4(142, 250, 1, 1), v4(172, 217, 2, 2)])
+        );
+        // An answer from before a network change is neither served nor stored.
+        remember_reference(
+            question.clone(),
+            google,
+            Some(vec![]),
+            generation.wrapping_sub(1),
+        );
+        assert_eq!(cached_references(&question).map(|a| a.len()), Some(2));
+    }
+
     fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+    }
+
+    #[test]
+    fn udp_rules_put_responding_servers_first_and_keep_their_other_addresses_once() {
+        let first = Ipv4Addr::new(192, 0, 2, 1);
+        let second = Ipv4Addr::new(192, 0, 2, 2);
+        let third = Ipv4Addr::new(192, 0, 2, 3);
+        let udp = |name: &str, ips| ActiveProvider {
+            name: name.into(),
+            transport: resolver_pool::Transport::Udp(ips),
+        };
+        let pool = [udp("a", vec![first, second]), udp("b", vec![first, third])];
+        let hit = |idx, server| RaceResult {
+            idx,
+            server,
+            addrs: vec![v4(203, 0, 113, 9)],
+            reply: vec![],
+        };
+        let hits = [hit(0, Some(second)), hit(1, Some(third))];
+        assert_eq!(
+            substituting_udp_servers(&pool, &hits, &[v4(142, 250, 1, 1)]),
+            [second, third, first].map(|ip| ip.to_string())
+        );
     }
 
     #[test]
@@ -710,14 +1023,14 @@ mod tests {
                 let _ = stream.read(&mut [0; 4096]);
                 let _ = stream.write_all(reply);
             });
-            assert!(verified_latency(addr, "localhost").is_none());
+            assert!(super::super::health::probe_ip(addr, "localhost").is_err());
             server.join().unwrap();
         }
         let (addr, server) = super::super::health::tests::server(
             b"HTTP/1.1 200 OK\r\n\r\n".to_vec(),
             Duration::ZERO,
         );
-        assert!(verified_latency(addr, "localhost").is_none());
+        assert!(super::super::health::probe_ip(addr, "localhost").is_err());
         server.join().unwrap();
     }
 
@@ -911,8 +1224,9 @@ mod tests {
 
     fn test_key(name: &str) -> CacheKey {
         CacheKey {
-            pool: format!("test-{name}"),
+            pool: format!("test-{name}").into(),
             interface: 0,
+            network_generation: NETWORK_GENERATION.load(Ordering::Acquire),
             question: build_query(name, 0)[2..].to_vec(),
         }
     }
@@ -985,6 +1299,59 @@ mod tests {
     }
 
     #[test]
+    fn lookup_threads_are_reused_and_leave_when_idle() {
+        let (done, finished) = mpsc::channel();
+        let first_thread = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&first_thread);
+        let tx = done.clone();
+        reuse::run(move || {
+            *seen.lock().unwrap() = Some(thread::current().id());
+            tx.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Let the worker list itself as idle, then hand it the next task.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while reuse::idle_count() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let second_thread = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&second_thread);
+        reuse::run(move || {
+            *seen.lock().unwrap() = Some(thread::current().id());
+            done.send(()).unwrap();
+        });
+        finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            *first_thread.lock().unwrap(),
+            *second_thread.lock().unwrap()
+        );
+
+        // A worker with nothing to do removes itself and ends.
+        let worker = thread::spawn(|| reuse::work(Box::new(|| {}), Duration::from_millis(20)));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn popular_answers_are_refreshed_once_before_they_expire() {
+        let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // The fixture answers with TTL 20 s: refresh once under 4 s is left.
+        let hit = address_hit("prefetch.test");
+        assert!(!expiring_soon(&hit.reply, Duration::from_secs(14)));
+        assert!(expiring_soon(&hit.reply, Duration::from_secs(16)));
+        let key = test_key("prefetch.test");
+        remember(key.clone(), &hit);
+        assert!(matches!(cached(&key), Lookup::Fresh(_)));
+        {
+            let mut guard = PACKETS.lock().unwrap();
+            let entry = guard.as_mut().unwrap().get_mut(&key).unwrap();
+            entry.at = Instant::now() - Duration::from_secs(17);
+        }
+        assert!(matches!(cached(&key), Lookup::Expiring(_)));
+        // The refresh is already running: later hits are plain fresh answers.
+        assert!(matches!(cached(&key), Lookup::Fresh(_)));
+    }
+
+    #[test]
     fn full_cache_evicts_the_oldest_answer_only() {
         let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         *PACKETS.lock().unwrap() = None;
@@ -1011,6 +1378,7 @@ mod tests {
 
     #[test]
     fn cache_is_invalidated_by_interface_endpoint_and_order_changes() {
+        let _serial = CACHE_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = super::super::config::Config::default();
         let pool = resolver_pool::from_config(&config).unwrap();
         let query = build_query("example.test", 1);
@@ -1020,10 +1388,31 @@ mod tests {
         config.doh[0].url = "https://another.test/dns-query".into();
         assert!(key != cache_key(&resolver_pool::from_config(&config).unwrap(), &query, 0));
         config = super::super::config::Config::default();
-        config.provider_order = vec!["geohide.ru".into(), "dns-ai.ru".into()];
+        config.provider_order = vec!["eu.geohide.ru".into(), "dns-ai.ru".into()];
         assert!(key != cache_key(&resolver_pool::from_config(&config).unwrap(), &query, 0));
         config.disabled_providers.push("dns-ai.ru".into());
         assert!(key != cache_key(&resolver_pool::from_config(&config).unwrap(), &query, 0));
+    }
+
+    #[test]
+    fn a_reply_from_before_a_route_change_cannot_repopulate_the_dns_cache() {
+        let _serial = CACHE_TESTS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let host = "vpn-switch.test";
+        let old = test_key(host);
+        remember(old.clone(), &address_hit(host));
+        assert!(matches!(cached(&old), Lookup::Fresh(_)));
+
+        invalidate_network_caches();
+        let current = test_key(host);
+        assert!(old != current);
+        remember(old.clone(), &address_hit(host));
+        assert!(matches!(cached(&old), Lookup::Miss));
+        assert!(matches!(cached(&current), Lookup::Miss));
+
+        remember(current.clone(), &address_hit(host));
+        assert!(matches!(cached(&current), Lookup::Fresh(_)));
     }
 
     #[test]
