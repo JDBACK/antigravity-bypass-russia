@@ -69,7 +69,7 @@ fn wait_for_other_holders_with(
     )
 }
 
-#[cfg(any(not(windows), test))]
+#[cfg(any(not(any(windows, target_os = "linux")), test))]
 fn wait_for_holders_to_exit(
     mut query: impl FnMut() -> Result<Vec<String>, String>,
     budget: std::time::Duration,
