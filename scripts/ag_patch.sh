@@ -20,8 +20,11 @@ usage() {
   (по умолчанию)      Пропатчить все найденные файлы Antigravity (без изменения DNS/сети).
                       На macOS патчит сначала MacBook, затем homelinux по SSH.
                       На Linux патчит локально.
+  --update, update    Безопасно обновить Antigravity (App, IDE, CLI, Hub Server) с проверкой
+                      совместимости патча до замены, затем сразу всё пропатчить
+  --check-updates     Проверить наличие новых версий у Google (без скачивания и изменений)
   --status, status    Показать статус файлов и открытых процессов (без изменений)
-  --dry-run           Показать план патча и открытые процессы без закрытия и изменений
+  --dry-run           Показать план (патча или --update) и открытые процессы без изменений
   --restore, restore  Откатить файловые патчи из бэкапа (без изменения DNS/сети)
 
 Выбор устройств:
@@ -59,6 +62,14 @@ while (( $# > 0 )); do
       ;;
     --patch|patch)
       mode="patch"
+      shift
+      ;;
+    --update|update)
+      mode="update"
+      shift
+      ;;
+    --check-updates|check-updates)
+      mode="check-updates"
       shift
       ;;
     --dry-run)
@@ -135,6 +146,7 @@ find_cargo() {
 script_dir=$(resolve_self_dir)
 repo_dir=$(cd -- "$script_dir/.." && pwd -P)
 engine="${AG_PATCH_ENGINE:-$repo_dir/target/release/antigravity-bypass-russia}"
+updater_script="${AG_PATCH_UPDATER:-$script_dir/ag_updater.py}"
 
 ensure_engine() {
   if [[ -n ${AG_PATCH_ENGINE:-} ]]; then
@@ -263,6 +275,22 @@ run_local() {
   label=$(host_label)
   print_banner "$label"
 
+  if [[ $mode == "check-updates" ]]; then
+    python3 "$updater_script" --engine "$engine" --check --os "$os_name"
+    return $?
+  fi
+
+  local update_rc=0
+  if [[ $mode == "update" ]]; then
+    if (( dry_run == 1 )); then
+      printf '  [dry-run] Проверка доступных обновлений (без скачивания и изменений):\n'
+      python3 "$updater_script" --engine "$engine" --dry-run --os "$os_name" || update_rc=$?
+    else
+      printf '  Проверка и безопасное обновление компонентов...\n'
+      python3 "$updater_script" --engine "$engine" --apply --os "$os_name" || update_rc=$?
+    fi
+  fi
+
   local inspect_json=""
   if ! inspect_json=$("$engine" inspect-files --json); then
     printf '✗ %s: не удалось проверить файлы Antigravity.\n' "$label" >&2
@@ -275,27 +303,32 @@ run_local() {
     return 0
   fi
 
+  local inspect_mode="$mode"
+  if [[ $inspect_mode == "update" ]]; then
+    inspect_mode="patch"
+  fi
+
   if (( dry_run == 1 )); then
     printf '  [dry-run] Режим проверки без закрытия приложений и без изменения файлов:\n'
-    run_inspect_report "$inspect_json" "$mode" "1"
-    return 0
+    run_inspect_report "$inspect_json" "$inspect_mode" "1"
+    return "$update_rc"
   fi
 
   local pending_count
-  pending_count=$(extract_pending_count "$inspect_json" "$mode")
+  pending_count=$(extract_pending_count "$inspect_json" "$inspect_mode")
   if (( pending_count == 0 )); then
-    run_inspect_report "$inspect_json" "$mode" "0"
-    return 0
+    run_inspect_report "$inspect_json" "$inspect_mode" "0"
+    return "$update_rc"
   fi
 
-  run_inspect_report "$inspect_json" "$mode" "0"
+  run_inspect_report "$inspect_json" "$inspect_mode" "0"
   local engine_cmd="patch-files"
-  if [[ $mode == "restore" ]]; then
+  if [[ $inspect_mode == "restore" ]]; then
     engine_cmd="restore-files"
   fi
 
   if AGY_PROMPT_CLOSE=1 "$engine" "$engine_cmd" --prompt-close; then
-    return 0
+    return "$update_rc"
   fi
   return 1
 }
@@ -305,6 +338,8 @@ run_remote() {
   case "$mode" in
     status) remote_args+=(--status) ;;
     restore) remote_args+=(--restore) ;;
+    update) remote_args+=(--update) ;;
+    check-updates) remote_args+=(--check-updates) ;;
     patch) ;;
   esac
   if (( dry_run == 1 )); then
@@ -352,7 +387,7 @@ main() {
     run_local || local_rc=$?
 
     local proceed_remote=1
-    if (( local_rc != 0 && dry_run == 0 )) && [[ $mode != "status" && -t 0 && -t 1 ]]; then
+    if (( local_rc != 0 && dry_run == 0 )) && [[ $mode != "status" && $mode != "check-updates" && -t 0 && -t 1 ]]; then
       printf '\nMacBook завершился с отменой или ошибкой. Перейти к %s? [Y/n]: ' "$ssh_host"
       local answer=""
       if read -r answer; then

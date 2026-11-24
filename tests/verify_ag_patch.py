@@ -301,9 +301,53 @@ def main():
             timeout=30,
         )
         assert res.returncode == 0, res
-        assert "ag-patch" in res.stdout
+        assert "ag-patch" in res.stdout and "--update" in res.stdout and "--check-updates" in res.stdout
 
-    print("PASS: all ag_patch.sh offline scenarios passed (10/10)")
+        # 11. --check-updates and --update call updater script and forward flags over SSH
+        case = root / "update-flow"
+        case.mkdir()
+        updater_log = case / "updater.log"
+        mock_updater = write_executable(
+            case / "mock-updater.py",
+            f"""#!/usr/bin/env python3
+import sys
+with open({str(updater_log)!r}, "a", encoding="utf-8") as f:
+    f.write("UPD:" + " ".join(sys.argv[1:]) + "\\n")
+print("  ✓ MOCK UPDATER OK")
+""",
+        )
+        engine, engine_log = make_mock_engine(case, sample_payload(needs_patch=1))
+        ssh, ssh_log = make_mock_ssh(case, reachable=True, remote_rc=0)
+        base_env = {
+            "AG_PATCH_OS": "Darwin",
+            "AG_PATCH_ENGINE": str(engine),
+            "AG_PATCH_SSH_BIN": str(ssh),
+            "AG_PATCH_UPDATER": str(mock_updater),
+        }
+        chk = run_script(["--check-updates"], base_env)
+        assert chk.returncode == 0, chk.stdout + chk.stderr
+        assert "--check" in updater_log.read_text(encoding="utf-8")
+        assert not engine_log.exists()
+        assert "--check-updates" in ssh_log.read_text(encoding="utf-8")
+
+        updater_log.unlink()
+        ssh_log.unlink()
+        dry = run_script(["--update", "--dry-run"], base_env)
+        assert dry.returncode == 0, dry.stdout + dry.stderr
+        assert "--dry-run" in updater_log.read_text(encoding="utf-8")
+        assert "patch-files" not in engine_log.read_text(encoding="utf-8")
+        assert "--update" in ssh_log.read_text(encoding="utf-8") and "--dry-run" in ssh_log.read_text(encoding="utf-8")
+
+        updater_log.unlink()
+        engine_log.unlink()
+        ssh_log.unlink()
+        upd = run_script(["--update"], base_env)
+        assert upd.returncode == 0, upd.stdout + upd.stderr
+        assert "--apply" in updater_log.read_text(encoding="utf-8")
+        assert "CALL:patch-files --prompt-close|PROMPT=1" in engine_log.read_text(encoding="utf-8")
+        assert "--update" in ssh_log.read_text(encoding="utf-8")
+
+    print("PASS: all ag_patch.sh offline scenarios passed (11/11)")
 
 
 if __name__ == "__main__":
