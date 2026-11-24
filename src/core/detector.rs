@@ -328,6 +328,11 @@ fn cli_search_dirs() -> Vec<PathBuf> {
         dirs.push(home.join(".gemini/bin"));
         dirs.push(home.join(".gemini/antigravity-cli/bin"));
         dirs.push(home.join(".gemini/antigravity/bin"));
+        let mise_cli = home.join(".local/share/mise/installs/antigravity-cli");
+        dirs.push(mise_cli.join("latest"));
+        dirs.push(mise_cli.join("latest/bin"));
+        dirs.push(mise_cli.join("global"));
+        dirs.push(mise_cli.join("global/bin"));
     }
     dirs
 }
@@ -337,6 +342,7 @@ fn cli_search_includes_ide_managed_installations() {
     let dirs = cli_search_dirs();
     for home in crate::system::env::get_user_homes() {
         assert!(dirs.contains(&home.join(".gemini/bin")));
+        assert!(dirs.contains(&home.join(".local/share/mise/installs/antigravity-cli/latest")));
     }
 }
 

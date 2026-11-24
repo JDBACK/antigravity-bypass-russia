@@ -12,6 +12,7 @@ fn print_help() {
         Команды:\n\
           unlock        Включить обход (файлы приложения и DNS)\n\
           patch-files   Патч поддерживаемых файлов [необязательный путь]\n\
+          restore-files Откат только файлов приложения [необязательный путь]\n\
           dns           Настройка SmartDNS / NRPT обхода\n\
           tune          Оптимизация сетевого стека TCP (Window Auto-Tuning, 512KB)\n\
           diagnostics   DNS, проверка TLS/сертификата и HTTP (без входа в аккаунт)\n\
@@ -89,6 +90,7 @@ fn main() {
             | "speed"
             | "unlock"
             | "patch-files"
+            | "restore-files"
             | "dns"
             | "rollback"
             | "restore"
@@ -99,7 +101,10 @@ fn main() {
         std::process::exit(2);
     }
     if args.len()
-        > if matches!(command, "patch-files" | "rollback" | "restore" | "report") {
+        > if matches!(
+            command,
+            "patch-files" | "restore-files" | "rollback" | "restore" | "report"
+        ) {
             3
         } else {
             2
@@ -132,6 +137,7 @@ fn main() {
     let ok = match command {
         "unlock" => ui::menu::handle_unlock_all(),
         "patch-files" => ui::menu::handle_patch_files_only(),
+        "restore-files" => ui::menu::handle_restore_files_only(),
         "dns" => ui::menu::handle_dns_only(),
         "speed" => ui::speed::run(),
         "rollback" | "restore" => ui::menu::handle_rollback(),

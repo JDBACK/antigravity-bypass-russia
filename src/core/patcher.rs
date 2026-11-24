@@ -163,8 +163,79 @@ fn x64_cli_gates(data: &[u8]) -> Result<Option<Vec<(usize, X64GateState)>>, Stri
     Ok(Some(gates))
 }
 
+fn x64_backend_cli_gate(data: &[u8]) -> Result<Option<(usize, X64GateState)>, String> {
+    let file = object::File::parse(data).map_err(|e| e.to_string())?;
+    if file.architecture() != Architecture::X86_64 {
+        return Ok(None);
+    }
+    let mut found = None;
+    for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
+        let Some((start, _)) = section.file_range() else {
+            continue;
+        };
+        let start = usize::try_from(start).map_err(|_| "Некорректное смещение секции")?;
+        let bytes = section.data().map_err(|e| e.to_string())?;
+        for (pattern, state) in [
+            (regex_cli_x64_backend_orig(), X64GateState::Stock),
+            (regex_cli_x64_backend_patched(), X64GateState::Patched),
+        ] {
+            for m in pattern.find_iter(bytes) {
+                if found.is_some() {
+                    return Err(
+                        "Неоднозначная проверка входа agy x64 backend; файл не изменён".into(),
+                    );
+                }
+                let code = m.as_bytes();
+                let relative =
+                    |at| i64::from(i32::from_le_bytes(code[at..at + 4].try_into().unwrap()));
+                let error = m.start() as i64 + 9 + relative(5);
+                let success = m.start() as i64 + 18 + relative(14);
+                let helper = m.end() as i64 + relative(33);
+                if !cli_x64_branches_share_target(&code[9..28])
+                    || error < m.end() as i64
+                    || success < m.end() as i64
+                    || error == success
+                    || error >= bytes.len() as i64
+                    || success >= bytes.len() as i64
+                    || helper < 0
+                    || helper + 32 >= bytes.len() as i64
+                {
+                    return Err("Некорректные переходы agy x64 backend; файл не изменён".into());
+                }
+                let helpers = x64_cli_gates(data)?.ok_or("Нет диагностической функции agy x64")?;
+                if helpers.len() != 1 || helpers[0].0 != start + helper as usize + 32 {
+                    return Err(
+                        "Вызов agy x64 backend не ведёт в проверенную диагностическую функцию"
+                            .into(),
+                    );
+                }
+                // Return the RCX test, matching the legacy planner's 19-byte
+                // layout. The error guard remains outside the modified range.
+                found = Some((start + m.start() + 9, state));
+            }
+        }
+    }
+    Ok(found)
+}
+
 fn plan_x64_cli(data: &[u8], legacy_cli: bool) -> Result<Plan, String> {
-    let gates = x64_cli_gates(data)?.ok_or("Нет профиля agy x64")?;
+    let diagnostic_gates = x64_cli_gates(data)?.ok_or("Нет профиля agy x64")?;
+    let backend_gate = if legacy_cli {
+        None
+    } else {
+        x64_backend_cli_gate(data)?
+    };
+    if backend_gate.is_some()
+        && diagnostic_gates
+            .iter()
+            .any(|(_, state)| *state != X64GateState::Stock)
+    {
+        return Err(
+            "Обнаружен патч диагностической функции agy x64; необходим проверенный исходный backup"
+                .into(),
+        );
+    }
+    let gates = backend_gate.map_or(diagnostic_gates, |gate| vec![gate]);
     if gates.iter().any(|(_, state)| {
         if legacy_cli {
             *state == X64GateState::Patched
@@ -227,6 +298,8 @@ fn plan_x64_cli(data: &[u8], legacy_cli: bool) -> Result<Plan, String> {
         existing,
         profile: if legacy_cli {
             "agy-x64-long-v1"
+        } else if backend_gate.is_some() {
+            "agy-x64-backend-v4"
         } else if hub_sites > 0 {
             "agy-x64-cli-hub-v3"
         } else {
@@ -526,6 +599,10 @@ fn is_legacy_x64_cli(data: &[u8]) -> bool {
             gates
                 .iter()
                 .any(|(_, state)| *state == X64GateState::Legacy)
+                || (gates
+                    .iter()
+                    .any(|(_, state)| *state == X64GateState::Patched)
+                    && x64_backend_cli_gate(data).is_ok_and(|gate| gate.is_some()))
         })
     })
 }
@@ -553,7 +630,37 @@ fn legacy_cli_backup_matches(original: &[u8], current: &[u8]) -> bool {
             };
             expected[current_at + at..current_at + at + fix.len()].copy_from_slice(fix);
         }
-        return expected == current;
+        if expected == current {
+            return true;
+        }
+        if let Ok(file) = object::File::parse(original) {
+            for section in file.sections().filter(|s| s.kind() == SectionKind::Text) {
+                let Some((start, size)) = section.file_range() else {
+                    continue;
+                };
+                let (Ok(start), Ok(size)) = (usize::try_from(start), usize::try_from(size)) else {
+                    return false;
+                };
+                let Some(end) = start.checked_add(size) else {
+                    return false;
+                };
+                let Some(bytes) = expected.get_mut(start..end) else {
+                    return false;
+                };
+                let _ = apply_pattern(
+                    bytes,
+                    regex_mgr_x64_orig(),
+                    regex_mgr_x64_patched(),
+                    MGR_GATE_X64_FIX,
+                    0,
+                    1,
+                );
+            }
+            if expected == current {
+                return true;
+            }
+        }
+        return false;
     }
     plan_binary_with_cli_profile(original, TargetKind::AgyCli, true)
         .is_ok_and(|p| p.changes == 1 && p.existing == 0 && p.data == current)
@@ -702,6 +809,84 @@ pub fn restore_target(target: &FoundTarget) -> Result<PatchOutcome, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn x64_backend_fixture() -> Vec<u8> {
+        let mut code = vec![0x90; 512];
+        let helper =
+            b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85\x00\x00\x00\x00";
+        code[32..32 + helper.len()].copy_from_slice(helper);
+        let hub = b"\x80\x78\x08\x00\x74\x0a\x48\x8b\x44\x24\x20\x48\x89\x44\x60";
+        code[64..64 + hub.len()].copy_from_slice(hub);
+        let gate = b"\x48\x85\xc0\x0f\x85\x00\x01\x00\x00\x48\x85\xc9\x0f\x84\x80\x00\x00\x00\x80\x79\x08\x00\x0f\x85\x76\x00\x00\x00\x48\x89\xc8\x90\xe8\x00\x00\x00\x00";
+        code[96..96 + gate.len()].copy_from_slice(gate);
+        code[96 + 33..96 + 37].copy_from_slice(&(-133i32).to_le_bytes());
+        pe_fixture(&code, 0x8664)
+    }
+
+    #[test]
+    fn x64_backend_patches_the_login_gate_and_preserves_diagnostics_and_error_handling() {
+        let stock = x64_backend_fixture();
+        let plan = plan_binary(&stock, TargetKind::AgyCli).unwrap();
+        assert_eq!((plan.changes, plan.existing), (2, 0));
+        assert_eq!(plan.profile, "agy-x64-backend-v4");
+        assert_eq!(&plan.data[512 + 32..512 + 51], &stock[512 + 32..512 + 51]);
+        assert_eq!(&plan.data[512 + 96..512 + 114], &stock[512 + 96..512 + 114]);
+        assert_eq!(&plan.data[512 + 114..512 + 118], CLI_GATE_X64_LONG_FIX);
+        assert_eq!(
+            &plan.data[512 + 118..512 + 133],
+            &stock[512 + 118..512 + 133]
+        );
+        let repeated = plan_binary(&plan.data, TargetKind::AgyCli).unwrap();
+        assert_eq!((repeated.changes, repeated.existing), (0, 2));
+        assert_eq!(repeated.data, plan.data);
+        for index in [96 + 5, 96 + 14, 96 + 24, 96 + 33] {
+            let mut invalid = stock.clone();
+            invalid[512 + index..512 + index + 4].copy_from_slice(&i32::MAX.to_le_bytes());
+            assert!(plan_binary(&invalid, TargetKind::AgyCli).is_err());
+        }
+        let mut duplicate = stock.clone();
+        duplicate[512 + 160..512 + 197].copy_from_slice(&stock[512 + 96..512 + 133]);
+        duplicate[512 + 193..512 + 197].copy_from_slice(&(-197i32).to_le_bytes());
+        assert!(plan_binary(&duplicate, TargetKind::AgyCli).is_err());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn x64_backend_replaces_the_old_diagnostic_patch_from_a_verified_backup() {
+        let stock = x64_backend_fixture();
+        let fresh = plan_binary(&stock, TargetKind::AgyCli).unwrap();
+        let mut old = stock.clone();
+        old[512 + 32 + 9..512 + 32 + 13].copy_from_slice(CLI_GATE_X64_LONG_FIX);
+        old[512 + 64..512 + 70].copy_from_slice(MGR_GATE_X64_FIX);
+        assert_eq!(
+            state_for_data(&old, TargetKind::AgyCli),
+            BinaryState::PartiallyPatched
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let target = FoundTarget {
+            path: directory.path().join("agy.exe"),
+            kind: TargetKind::AgyCli,
+            name: "agy".into(),
+        };
+        fs::write(&target.path, &old).unwrap();
+        assert!(patch_target(&target).is_err());
+        assert_eq!(fs::read(&target.path).unwrap(), old);
+        let legacy_bak = target.path.with_extension("bak");
+        fs::write(&legacy_bak, &stock).unwrap();
+        assert_eq!(patch_target(&target).unwrap(), PatchOutcome::Changed(2));
+        assert_eq!(fs::read(&target.path).unwrap(), fresh.data);
+        assert_eq!(restore_target(&target).unwrap(), PatchOutcome::Restored);
+        assert_eq!(fs::read(&target.path).unwrap(), stock);
+        fs::remove_file(&legacy_bak).unwrap();
+        fs::remove_dir_all(directory.path().join("agy.exe.ag-backups")).unwrap();
+        fs::write(&target.path, &stock).unwrap();
+        journal::apply(&target.path, Some(&stock), &old, "agy-x64-cli-hub-v3").unwrap();
+        assert_eq!(patch_target(&target).unwrap(), PatchOutcome::Changed(2));
+        assert_eq!(fs::read(&target.path).unwrap(), fresh.data);
+        assert_eq!(patch_target(&target).unwrap(), PatchOutcome::AlreadyPatched);
+        assert_eq!(restore_target(&target).unwrap(), PatchOutcome::Restored);
+        assert_eq!(fs::read(&target.path).unwrap(), stock);
+    }
+
     #[test]
     fn x64_hub_gate_upgrade_is_transactional_and_reversible() {
         let cli = b"\x48\x85\xc0\x0f\x84\x0a\x00\x00\x00\x80\x78\x08\x00\x0f\x85\x00\x00\x00\x00";

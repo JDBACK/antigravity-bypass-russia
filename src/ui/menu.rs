@@ -347,6 +347,52 @@ pub fn handle_patch_files_only() -> bool {
     pause();
     ok
 }
+pub fn handle_restore_files_only() -> bool {
+    let installs = if let Some(path) = crate::system::env::args().nth(2) {
+        let root = expand_env_vars(&path);
+        if let Err(error) = recover_targets_in_path(&root) {
+            operation_error("Не удалось восстановить прерванную запись", &error);
+            return false;
+        }
+        vec![root]
+    } else {
+        if let Err(error) = recover_installations() {
+            operation_error("Не удалось восстановить прерванную запись", &error);
+            return false;
+        }
+        find_installations()
+    };
+    let paths: Vec<_> = installs
+        .iter()
+        .flat_map(|root| find_targets_in_path(root))
+        .map(|t| t.path)
+        .collect();
+    if !ensure_application_closed(&paths, "восстановление файлов") {
+        return false;
+    }
+    let mut ok = !paths.is_empty();
+    if paths.is_empty() {
+        if let Some(root) = installs.first() {
+            eprintln!("[✗] Цели для отката не найдены: {}", mask_path(root));
+        } else {
+            eprintln!("[✗] Установки не найдены.");
+        }
+    }
+    for root in installs {
+        for target in find_targets_in_path(&root) {
+            ok &= print_patch_result(&target, restore_target(&target));
+        }
+    }
+    if !paths.is_empty() {
+        if let Err(error) = clear_ide_v8_caches() {
+            operation_error("Не удалось очистить кэш приложения", &error);
+            ok = false;
+        }
+    }
+    show_result(ok);
+    pause();
+    ok
+}
 pub fn handle_dns_only() -> bool {
     if !check_vpn_before_setup() {
         return false;

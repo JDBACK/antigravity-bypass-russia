@@ -358,19 +358,36 @@ fn linux_lsof_stderr_is_safe(stderr: &str, paths: &[PathBuf]) -> bool {
         else {
             return false;
         };
-        let directory = match filesystem {
-            "fuse.portal" => "doc",
-            "fuse.gvfsd-fuse" => "gvfs",
-            _ => return false,
+        let known_mount = match filesystem {
+            "efivarfs" => mount == "/sys/firmware/efi/efivars",
+            "tracefs" => matches!(mount, "/sys/kernel/tracing" | "/sys/kernel/debug/tracing"),
+            "debugfs" => mount == "/sys/kernel/debug",
+            "fuse.portal" | "fuse.gvfsd-fuse" => {
+                let directory = if filesystem == "fuse.portal" {
+                    "doc"
+                } else {
+                    "gvfs"
+                };
+                mount
+                    .strip_prefix("/run/user/")
+                    .and_then(|path| path.strip_suffix(&format!("/{directory}")))
+                    .is_some_and(|uid| {
+                        !uid.is_empty()
+                            && uid.bytes().all(|b| b.is_ascii_digit())
+                            && uid.parse::<u32>().is_ok()
+                    })
+            }
+            _ => {
+                filesystem
+                    .strip_prefix("fuse.")
+                    .and_then(|name| name.strip_suffix(".AppImage"))
+                    .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+                    && mount
+                        .strip_prefix("/tmp/.mount_")
+                        .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+            }
         };
-        let Some(uid) = mount
-            .strip_prefix("/run/user/")
-            .and_then(|path| path.strip_suffix(&format!("/{directory}")))
-        else {
-            return false;
-        };
-        if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) || uid.parse::<u32>().is_err()
-        {
+        if !known_mount {
             return false;
         }
         // These desktop mounts are unrelated only when every target can be
@@ -512,14 +529,23 @@ mod mac_lock_tests {
         let warnings = "lsof: WARNING: can't stat() fuse.portal file system /run/user/1000/doc\n\
                         Output information may be incomplete.\n\
                         lsof: WARNING: can't stat() fuse.gvfsd-fuse file system /run/user/1000/gvfs\n\
+                        Output information may be incomplete.\n\
+                        lsof: WARNING: can't stat() efivarfs file system /sys/firmware/efi/efivars\n\
                         Output information may be incomplete.";
         assert!(super::linux_lsof_stderr_is_safe(warnings, &paths));
         for stderr in [
             "lsof: WARNING: can't stat() ext4 file system /opt",
+            "lsof: WARNING: can't stat() efivarfs file system /opt",
             "lsof: WARNING: can't stat() fuse.sshfs file system /run/user/1000/gvfs",
             "lsof: WARNING: can't stat() fuse.portal file system /opt/doc",
             "lsof: WARNING: can't stat() fuse.portal file system /run/user/invalid/doc",
             "lsof: WARNING: can't stat() fuse.portal file system /run/user/1000/doc/subdir",
+            "lsof: WARNING: can't stat() fuse.T3-Code.AppImage file system /opt/T3-Code",
+            "lsof: WARNING: can't stat() fuse.T3-Code.AppImage file system /tmp/.mount_",
+            "lsof: WARNING: can't stat() fuse.T3-Code.AppImage file system /tmp/.mount_T3-CodPIfOIN/subdir",
+            "lsof: WARNING: can't stat() fuse.T3-Code.AppImage file system /tmp/.mount_T3-CodPIfOIN/../other",
+            "lsof: WARNING: can't stat() fuse.AppImage file system /tmp/.mount_T3-CodPIfOIN",
+            "lsof: WARNING: can't stat() fuse.sshfs file system /tmp/.mount_T3-CodPIfOIN",
             "lsof: WARNING: permission denied",
             "Output information may be incomplete.",
         ] {
@@ -560,6 +586,73 @@ mod mac_lock_tests {
         }
         #[cfg(not(target_os = "linux"))]
         assert!(super::parse_lsof(Some(1), "", warnings, &paths).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_appimage_mount_warnings_preserve_file_holder_results() {
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let paths = [target.path().to_path_buf()];
+        let warnings = "lsof: WARNING: can't stat() fuse.portal file system /run/user/1000/doc\n\
+                              Output information may be incomplete.\n\
+                        lsof: WARNING: can't stat() fuse.gvfsd-fuse file system /run/user/1000/gvfs\n\
+                              Output information may be incomplete.\n\
+                        lsof: WARNING: can't stat() fuse.T3-Code.AppImage file system /tmp/.mount_T3-CodPIfOIN\n\
+                              Output information may be incomplete.\n\
+                        lsof: WARNING: can't stat() fuse.T3-Code.AppImage file system /tmp/.mount_T3-CodnNhdpF\n\
+                              Output information may be incomplete.\n";
+        assert!(super::parse_lsof(Some(1), "", warnings, &paths)
+            .unwrap()
+            .is_empty());
+        for code in [Some(0), Some(1)] {
+            assert_eq!(
+                super::parse_lsof(code, "p123\ncantigravity\n", warnings, &paths).unwrap(),
+                ["antigravity (PID 123)"]
+            );
+        }
+        for code in [Some(2), None] {
+            assert!(super::parse_lsof(code, "", warnings, &paths).is_err());
+        }
+        assert!(super::parse_lsof(Some(0), "unparseable", warnings, &paths).is_err());
+        assert!(super::parse_lsof(
+            Some(1),
+            "",
+            &format!("{warnings}lsof: fatal: permission denied"),
+            &paths
+        )
+        .is_err());
+        assert!(super::parse_lsof(Some(1), "", warnings, &[]).is_err());
+        assert!(
+            super::parse_lsof(Some(1), "", warnings, &[target.path().join("missing")]).is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn appimage_mount_warnings_block_targets_inside_the_mount_and_links_to_them() {
+        let mount = tempfile::Builder::new()
+            .prefix(".mount_")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let target = mount.path().join("antigravity");
+        std::fs::write(&target, b"fixture").unwrap();
+        let warnings = format!(
+            "lsof: WARNING: can't stat() fuse.Antigravity.AppImage file system {}\n      Output information may be incomplete.",
+            mount.path().display()
+        );
+        assert!(super::parse_lsof(Some(1), "", &warnings, &[target.clone()]).is_err());
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join("antigravity");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(super::parse_lsof(Some(1), "", &warnings, &[link]).is_err());
+        let unrelated = outside.path().join("unrelated");
+        std::fs::write(&unrelated, b"fixture").unwrap();
+        assert!(
+            super::parse_lsof(Some(1), "", &warnings, &[unrelated.clone()])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(super::parse_lsof(Some(1), "", &warnings, &[unrelated, target]).is_err());
     }
 
     #[cfg(target_os = "macos")]
