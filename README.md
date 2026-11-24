@@ -79,6 +79,16 @@
 3. В меню выберите пункт **`1`**.
 </details>
 
+#### Только файловый патч CLI
+Если подключение уже работает через VPN и нужен только патч файлов Antigravity CLI (`agy.exe` / `antigravity.exe`), из папки репозитория запустите `.\scripts\patch_cli.ps1` в PowerShell:
+```powershell
+.\scripts\patch_cli.ps1            # применить патч к Antigravity CLI
+.\scripts\patch_cli.ps1 --status   # проверить текущий статус
+.\scripts\patch_cli.ps1 --restore  # откатить только бинарник CLI из бэкапа
+.\scripts\patch_cli.ps1 C:\полный\путь\к\agy.exe   # или указать бинарник явно
+```
+Скрипт автоматически находит нативный CLI в `PATH` и в каталогах `mise`/`scoop` (включая раскрытие симлинков и shims), пересобирает движок только при изменении исходников и пробрасывает `patch-files`/`restore-files`/`status` с exit-кодом наружу. DNS и сетевые настройки не меняются.
+
 ---
 
 ### 🍏 macOS (Apple Silicon & Intel)
@@ -113,7 +123,7 @@ chmod +x scripts/unlock_and_restore.sh
 ./scripts/patch_cli.sh --status   # проверить текущий статус
 ./scripts/patch_cli.sh --restore  # откатить только бинарник CLI из бэкапа
 ```
-*(DNS и `/etc/hosts` не изменяются; поддерживаются `PATH`, `~/.local/bin`, `~/.gemini/bin`, Homebrew и `mise`.)*
+*(DNS и `/etc/hosts` не изменяются; поддерживаются `PATH`, `~/.local/bin`, `~/.gemini/bin`, Homebrew и `mise`. На Windows используйте `.\scripts\patch_cli.ps1` — см. раздел Windows.)*
 
 ---
 

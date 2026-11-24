@@ -19,80 +19,141 @@ function Write-Usage {
 "@
 }
 
+function Fail {
+    param([string]$Message, [int]$Code = 1)
+    # Write plain stderr text instead of Write-Error: under
+    # $ErrorActionPreference='Stop' a Write-Error aborts the script with a
+    # PowerShell ErrorRecord and stack trace before reaching a useful exit code.
+    [Console]::Error.WriteLine($Message)
+    exit $Code
+}
+
 $action = 'patch-files'
 $rebuild = $false
 $cliPath = ''
+$positionalOnly = $false
 
-foreach ($arg in $args) {
+for ($i = 0; $i -lt $args.Count; $i++) {
+    $arg = $args[$i]
+    if ($positionalOnly) {
+        if ($cliPath) { [Console]::Error.WriteLine("Лишний аргумент: $arg"); Write-Usage; exit 2 }
+        $cliPath = $arg
+        continue
+    }
     switch ($arg) {
         { $_ -in '-h', '--help', 'help' } { Write-Usage; exit 0 }
         { $_ -in '--status', 'status' } { $action = 'status'; continue }
         { $_ -in '--restore', 'restore' } { $action = 'restore-files'; continue }
         { $_ -in '--patch', 'patch' } { $action = 'patch-files'; continue }
         '--rebuild' { $rebuild = $true; continue }
-        '--' { continue }
+        '--' { $positionalOnly = $true; continue }
         { $_ -like '-*' } {
-            Write-Error "Неизвестная опция: $arg"
+            [Console]::Error.WriteLine("Неизвестная опция: $arg")
             Write-Usage
             exit 2
         }
         default {
-            if ($cliPath) {
-                Write-Error "Лишний аргумент: $arg"
-                Write-Usage
-                exit 2
-            }
+            if ($cliPath) { [Console]::Error.WriteLine("Лишний аргумент: $arg"); Write-Usage; exit 2 }
             $cliPath = $arg
         }
     }
 }
 
 function Resolve-CliPath {
-    param([string]$Path)
-    # Resolve-Path resolves to a canonical absolute path; .NET resolves any
-    # directory junctions/symlinks along the way.
-    return (Resolve-Path -LiteralPath $Path).Path
+    # The Rust engine refuses to patch a symlink, so unwrap reparse points
+    # (symlinks/junctions) and scoop .shim files to the real binary.
+    param([string]$Path, [int]$Depth = 0)
+    if ($Depth -gt 10) { return [IO.Path]::GetFullPath($Path) }
+    $full = [IO.Path]::GetFullPath($Path)
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return $full }
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -and $item.Target) {
+        $target = [string](@($item.Target)[0])
+        if (-not [IO.Path]::IsPathRooted($target)) {
+            $target = Join-Path (Split-Path -Parent $full) $target
+        }
+        return Resolve-CliPath -Path $target -Depth ($Depth + 1)
+    }
+    # A scoop shim is a small loader exe; the real binary is in the sibling .shim file.
+    $shim = [IO.Path]::ChangeExtension($full, '.shim')
+    if (Test-Path -LiteralPath $shim -PathType Leaf) {
+        $line = Get-Content -LiteralPath $shim -TotalCount 4 |
+            Where-Object { $_ -match '^\s*path\s*=' } | Select-Object -First 1
+        if ($line -match '^\s*path\s*=\s*"?([^"\r\n]+?)"?\s*$') {
+            return Resolve-CliPath -Path $Matches[1] -Depth ($Depth + 1)
+        }
+    }
+    return $full
 }
 
 function Test-NativeGoCli {
+    # Mirrors native_cli() in src/core/detector.rs: parse the PE section table,
+    # then look for the "\xff Go buildinf:" marker inside candidate sections.
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     try {
         $stream = [System.IO.File]::OpenRead($Path)
         try {
             $reader = New-Object System.IO.BinaryReader($stream)
-            # A native CLI is a PE image: MZ header, PE signature at e_lfanew.
             if ($reader.ReadUInt16() -ne 0x5A4D) { return $false } # 'MZ'
             $stream.Position = 0x3C
             $peOffset = $reader.ReadInt32()
             $stream.Position = $peOffset
             if ($reader.ReadUInt32() -ne 0x00004550) { return $false } # 'PE\0\0'
-            # Go binaries carry a buildinfo section. Its PE name may live in
-            # the COFF string table, so scan the file for the marker bytes
-            # (".go.buildinfo" / "Go buildinf") in 4 MB chunks instead.
-            $markers = @(
-                [Text.Encoding]::ASCII.GetBytes('.go.buildinfo'),
-                [Text.Encoding]::ASCII.GetBytes('Go buildinf')
-            )
-            $tail = New-Object byte[] 0
-            $buffer = New-Object byte[] 4MB
-            while (($read = $reader.Read($buffer, 0, $buffer.Length)) -gt 0) {
-                # Prepend the tail so a marker split across chunks is still found.
-                $scan = New-Object byte[] ($tail.Length + $read)
-                [Array]::Copy($tail, 0, $scan, 0, $tail.Length)
-                [Array]::Copy($buffer, 0, $scan, $tail.Length, $read)
-                foreach ($marker in $markers) {
-                    for ($i = 0; $i -le $scan.Length - $marker.Length; $i++) {
-                        $match = $true
-                        for ($j = 0; $j -lt $marker.Length; $j++) {
-                            if ($scan[$i + $j] -ne $marker[$j]) { $match = $false; break }
-                        }
-                        if ($match) { return $true }
+            $stream.Position = $peOffset + 4 + 2
+            $sectionCount = $reader.ReadUInt16()
+            $stream.Position = $peOffset + 4 + 8
+            $symbolTableOffset = $reader.ReadUInt32()
+            $symbolCount = $reader.ReadUInt32()
+            $optHeaderSize = $reader.ReadUInt16()
+            $sectionTable = $peOffset + 4 + 20 + $optHeaderSize
+
+            # Long section names (>8 chars) are stored as "/offset" pointing
+            # into the COFF string table after the symbol table.
+            $stringTableOffset = $symbolTableOffset + 18 * $symbolCount
+
+            $candidates = @()
+            for ($i = 0; $i -lt $sectionCount; $i++) {
+                $stream.Position = $sectionTable + 40 * $i
+                $nameBytes = $reader.ReadBytes(8)
+                $name = [Text.Encoding]::ASCII.GetString($nameBytes).TrimEnd([char]0)
+                if ($name -match '^/(\d+)$' -and $stringTableOffset -gt 0) {
+                    $saved = $stream.Position
+                    try {
+                        $stream.Position = $stringTableOffset + [int]$Matches[1]
+                        $chars = New-Object System.Collections.Generic.List[byte]
+                        while (($b = $reader.ReadByte()) -ne 0) { $chars.Add($b) }
+                        $name = [Text.Encoding]::ASCII.GetString($chars.ToArray())
+                    } catch { }
+                    $stream.Position = $saved
+                }
+                if ($name -in '.go.buildinfo', '__go_buildinfo', '.data') {
+                    $stream.Position = $sectionTable + 40 * $i + 16
+                    $rawSize = $reader.ReadUInt32()
+                    $rawOffset = $reader.ReadUInt32()
+                    if ($rawSize -gt 0 -and $rawOffset -gt 0) {
+                        $candidates += ,@($rawOffset, [Math]::Min($rawSize, 64KB))
                     }
                 }
-                $tailLength = [Math]::Min(16, $scan.Length)
-                $tail = New-Object byte[] $tailLength
-                [Array]::Copy($scan, $scan.Length - $tailLength, $tail, 0, $tailLength)
+            }
+
+            foreach ($candidate in $candidates) {
+                $stream.Position = $candidate[0]
+                $bytes = $reader.ReadBytes([int]$candidate[1])
+                if (-not $bytes) { continue }
+                # Latin1 maps bytes 1:1, so .IndexOf on the decoded string is
+                # a native search over at most 64 KB instead of a PS loop.
+                $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes)
+                $marker = "$([char]0xFF) Go buildinf:"
+                $at = $text.IndexOf($marker, [StringComparison]::Ordinal)
+                while ($at -ge 0) {
+                    if ($at + 15 -lt $bytes.Length -and
+                        ($bytes[$at + 14] -eq 4 -or $bytes[$at + 14] -eq 8) -and
+                        ($bytes[$at + 15] -band (-bnot 3)) -eq 0) {
+                        return $true
+                    }
+                    $at = $text.IndexOf($marker, $at + 1, [StringComparison]::Ordinal)
+                }
             }
             return $false
         } finally {
@@ -103,27 +164,64 @@ function Test-NativeGoCli {
     }
 }
 
+function Test-MiseShim {
+    param([string]$Path)
+    $leaf = Split-Path -Leaf $Path
+    return (($leaf -like 'mise*') -or ($Path -like '*\mise\shims\*'))
+}
+
+function Resolve-MiseShim {
+    param([string]$ShimPath, [string]$Name)
+    $toolName = [IO.Path]::GetFileNameWithoutExtension($Name)
+    $miseExe = $null
+    if ((Split-Path -Leaf $ShimPath) -like 'mise*') {
+        $miseExe = $ShimPath
+    } else {
+        $cmd = Get-Command mise.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($cmd) { $miseExe = $cmd.Source }
+    }
+    if (-not $miseExe) { return $null }
+    try { $candidate = (& $miseExe which $toolName 2>$null | Select-Object -First 1) } catch { return $null }
+    if ($candidate -and (Test-Path -LiteralPath "$candidate" -PathType Leaf)) {
+        $resolved = Resolve-CliPath "$candidate"
+        if (-not (Test-MiseShim $resolved)) { return $resolved }
+    }
+    return $null
+}
+
 function Find-Cli {
     param([string]$Candidate)
     if ($Candidate) {
         if (-not (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
-            Write-Error "Файл не найден: $Candidate"
-            exit 1
+            Fail "Файл не найден: $Candidate"
         }
-        return (Resolve-CliPath $Candidate)
+        $resolved = Resolve-CliPath $Candidate
+        if (Test-MiseShim $resolved) {
+            $unwrapped = Resolve-MiseShim $resolved (Split-Path -Leaf $Candidate)
+            if (-not $unwrapped) {
+                Fail "Не удалось разрешить mise-shim: $Candidate"
+            }
+            return $unwrapped
+        }
+        return $resolved
     }
 
-    # 1) PATH lookup: only accept a real PE binary, skip .cmd/.ps1 shims.
+    # 1) PATH lookup: unwrap shims, then accept only a real native Go binary
+    #    (skips .cmd/.ps1 wrappers and the IDE's Electron executable).
     foreach ($name in 'antigravity.exe', 'agy.exe', 'antigravity', 'agy') {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandType -eq 'Application' } |
             Select-Object -First 1
-        if ($cmd -and (Test-NativeGoCli $cmd.Source)) {
-            return $cmd.Source
+        if (-not $cmd) { continue }
+        $resolved = Resolve-CliPath $cmd.Source
+        if (Test-MiseShim $resolved) {
+            $resolved = Resolve-MiseShim $resolved $name
+            if (-not $resolved) { continue }
         }
+        if (Test-NativeGoCli $resolved) { return $resolved }
     }
 
-    # 2) Known install locations (mirrors engine detector + mise/scoop layouts).
+    # 2) Known install locations (mirrors the engine detector + mise/scoop layouts).
     $userHome = [Environment]::GetFolderPath('UserProfile')
     $local = $env:LOCALAPPDATA
     $fallbacks = @(
@@ -133,30 +231,36 @@ function Find-Cli {
         "$local\mise\installs\antigravity-cli\latest\antigravity.exe",
         "$local\mise\installs\antigravity-cli\global\bin\agy.exe",
         "$local\mise\installs\antigravity-cli\global\agy.exe",
+        "$local\mise\shims\agy.exe",
+        "$local\mise\shims\antigravity.exe",
         "$local\agy\agy.exe",
         "$local\agy\antigravity.exe",
         "$local\Programs\Antigravity CLI\agy.exe",
         "$local\Programs\antigravity-cli\agy.exe",
         "$local\Programs\Antigravity\agy.exe",
-        "$env:USERPROFILE\.gemini\antigravity-cli\bin\agy.exe",
-        "$env:USERPROFILE\.gemini\antigravity-cli\bin\antigravity.exe",
-        "$env:USERPROFILE\.gemini\bin\agy.exe",
-        "$env:USERPROFILE\.agy\bin\agy.exe",
-        "$env:USERPROFILE\.agy\bin\antigravity.exe",
-        "$env:USERPROFILE\scoop\apps\agy\current\agy.exe",
-        "$env:USERPROFILE\scoop\apps\antigravity-cli\current\agy.exe",
-        "$env:USERPROFILE\scoop\apps\antigravity-cli\current\antigravity.exe",
-        "$env:USERPROFILE\scoop\shims\agy.exe",
-        "$env:USERPROFILE\scoop\shims\antigravity.exe"
+        "$userHome\.gemini\antigravity-cli\bin\agy.exe",
+        "$userHome\.gemini\antigravity-cli\bin\antigravity.exe",
+        "$userHome\.gemini\bin\agy.exe",
+        "$userHome\.agy\bin\agy.exe",
+        "$userHome\.agy\bin\antigravity.exe",
+        "$userHome\scoop\apps\agy\current\agy.exe",
+        "$userHome\scoop\apps\antigravity-cli\current\agy.exe",
+        "$userHome\scoop\apps\antigravity-cli\current\antigravity.exe",
+        "$userHome\scoop\shims\agy.exe",
+        "$userHome\scoop\shims\antigravity.exe"
     )
     foreach ($item in $fallbacks) {
-        if ((Test-Path -LiteralPath $item -PathType Leaf) -and (Test-NativeGoCli $item)) {
-            return (Resolve-CliPath $item)
+        if (Test-Path -LiteralPath $item -PathType Leaf) {
+            $resolved = Resolve-CliPath $item
+            if (Test-MiseShim $resolved) {
+                $resolved = Resolve-MiseShim $resolved (Split-Path -Leaf $item)
+                if (-not $resolved) { continue }
+            }
+            if (Test-NativeGoCli $resolved) { return $resolved }
         }
     }
 
-    Write-Error 'Antigravity CLI не найден. Передайте путь к исполняемому файлу аргументом.'
-    exit 1
+    Fail 'Antigravity CLI не найден. Передайте путь к исполняемому файлу аргументом.'
 }
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -195,8 +299,7 @@ function Find-Cargo {
 if (Test-NeedsBuild) {
     $cargo = Find-Cargo
     if (-not $cargo) {
-        Write-Error 'Rust/Cargo не найден. Установите rustup (https://rustup.rs) и повторите запуск.'
-        exit 1
+        Fail 'Rust/Cargo не найден. Установите rustup (https://rustup.rs) и повторите запуск.'
     }
     $cargoDir = Split-Path -Parent $cargo
     $env:PATH = "$cargoDir;$env:PATH"
