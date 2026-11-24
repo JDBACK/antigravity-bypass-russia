@@ -462,7 +462,7 @@ pub fn listen(browser: bool) -> io::Result<u16> {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
                 if active
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
                         (count < MAX_CONNECTIONS).then_some(count + 1)
                     })
                     .is_err()
