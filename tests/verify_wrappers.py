@@ -139,5 +139,137 @@ exec() {
             assert build_uid.read_text().strip() == "501", mode
             assert sudo_marker.exists() == (uid == "0"), mode
             print(f"PASS: source launcher: {mode}")
+
+        if os.name != "nt":
+            # Exercise the unified Linux/macOS CLI wrapper and its Linux compatibility alias.
+            cli_repo = Path(temporary) / "cli checkout with spaces"
+            cli_scripts = cli_repo / "scripts"
+            cli_src = cli_repo / "src"
+            cli_scripts.mkdir(parents=True)
+            cli_src.mkdir(parents=True)
+            (cli_repo / "Cargo.toml").write_text("# cli fixture\n", encoding="utf-8")
+            (cli_repo / "Cargo.lock").write_text("# lock fixture\n", encoding="utf-8")
+            (cli_repo / "build.rs").write_text("fn main() {}\n", encoding="utf-8")
+            (cli_src / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
+            for name in ("patch_cli.sh", "patch_cli_linux.sh"):
+                dest = cli_scripts / name
+                shutil.copyfile(ROOT / "scripts" / name, dest)
+                dest.chmod(0o755)
+                syntax = run([bash, "-n", str(dest)])
+                assert syntax.returncode == 0, (name, syntax.stderr)
+
+            cli_engine = cli_repo / "target" / "release" / "antigravity-bypass-russia"
+            cli_engine.parent.mkdir(parents=True)
+            cli_cargo_dir = cli_repo / "toolchain" / "bin"
+            cli_cargo_dir.mkdir(parents=True)
+            cli_build_count = cli_repo / "build-count.txt"
+            cli_build_count.write_text("0\n", encoding="utf-8")
+            cli_cargo_stub = cli_cargo_dir / "cargo"
+            cli_cargo_stub.write_bytes('''#!/bin/bash
+set -euo pipefail
+count=$(cat "$ABR_CLI_BUILD_COUNT")
+printf '%s\\n' "$((count + 1))" > "$ABR_CLI_BUILD_COUNT"
+cat > "$ABR_CLI_REPO/target/release/antigravity-bypass-russia" <<'ENGINE'
+#!/bin/bash
+printf '%s\\n' "$@"
+exit 11
+ENGINE
+chmod +x "$ABR_CLI_REPO/target/release/antigravity-bypass-russia"
+'''.encode("utf-8"))
+            cli_cargo_stub.chmod(0o755)
+
+            fake_bin = cli_repo / "fake-bin"
+            fake_bin.mkdir()
+            # Wrapper script named `antigravity` in PATH must be skipped in favor of native Go CLI.
+            ide_wrapper = fake_bin / "antigravity"
+            ide_wrapper.write_text("#!/bin/sh\necho ide wrapper\n", encoding="utf-8")
+            ide_wrapper.chmod(0o755)
+
+            real_cli = cli_repo / "real-install" / "agy"
+            real_cli.parent.mkdir(parents=True)
+            real_cli.write_bytes(b"\xcf\xfa\xed\xfeFAKE_GO_CLI")
+            real_cli.chmod(0o755)
+            mise_bin = fake_bin / "mise"
+            mise_bin.write_bytes(f'''#!/bin/bash
+if [[ "$1" == which && "$2" == agy ]]; then
+  printf '%s\\n' "{real_cli.as_posix()}"
+  exit 0
+fi
+exit 1
+'''.encode("utf-8"))
+            mise_bin.chmod(0o755)
+            os.symlink(mise_bin, fake_bin / "agy")
+
+            # Provide lightweight native-Go detector stubs matching the host OS tool.
+            if os.uname().sysname == "Darwin":
+                otool_stub = fake_bin / "otool"
+                otool_stub.write_bytes(f'''#!/bin/bash
+if [[ "$2" == "{real_cli.resolve().as_posix()}" ]]; then
+  echo "  sectname __go_buildinfo"
+  exit 0
+fi
+exit 1
+'''.encode("utf-8"))
+                otool_stub.chmod(0o755)
+            else:
+                readelf_stub = fake_bin / "readelf"
+                readelf_stub.write_bytes(f'''#!/bin/bash
+if [[ "$2" == "{real_cli.resolve().as_posix()}" ]]; then
+  echo "  [12] .go.buildinfo PROGBITS"
+  exit 0
+fi
+exit 1
+'''.encode("utf-8"))
+                readelf_stub.chmod(0o755)
+
+            cli_env = dict(
+                os.environ,
+                PATH=f"{fake_bin.as_posix()}:{cli_cargo_dir.as_posix()}:{os.environ.get('PATH', '')}",
+                HOME=(cli_repo / "empty-home").as_posix(),
+                ABR_CLI_REPO=cli_repo.as_posix(),
+                ABR_CLI_BUILD_COUNT=cli_build_count.as_posix(),
+            )
+            (cli_repo / "empty-home").mkdir()
+
+            # 1) First run builds engine, skips IDE shell wrapper, resolves mise shim -> real_cli.
+            res = subprocess.run(
+                [bash, str(cli_scripts / "patch_cli.sh")],
+                env=cli_env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            assert res.returncode == 11, (res.returncode, res.stdout, res.stderr)
+            assert res.stdout.splitlines() == ["patch-files", str(real_cli.resolve())], res.stdout
+            assert cli_build_count.read_text().strip() == "1"
+
+            # 2) Second run (--status via compatibility alias) reuses built engine without rebuilding.
+            res = subprocess.run(
+                [bash, str(cli_scripts / "patch_cli_linux.sh"), "--status"],
+                env=cli_env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            assert res.returncode == 11, (res.returncode, res.stdout, res.stderr)
+            assert res.stdout.splitlines() == ["status"], res.stdout
+            assert cli_build_count.read_text().strip() == "1"
+
+            # 3) An older engine triggers incremental rebuild (verifies POSIX find -newer).
+            past_mtime = (cli_src / "main.rs").stat().st_mtime - 10
+            os.utime(cli_engine, (past_mtime, past_mtime))
+            res = subprocess.run(
+                [bash, str(cli_scripts / "patch_cli.sh"), "--restore"],
+                env=cli_env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            assert res.returncode == 11, (res.returncode, res.stdout, res.stderr)
+            assert res.stdout.splitlines() == ["restore-files", str(real_cli.resolve())], res.stdout
+            assert cli_build_count.read_text().strip() == "2"
+
+            # 4) Explicit path resolves symlinks and passes through cleanly.
+            explicit_link = cli_repo / "explicit-link"
+            os.symlink(real_cli, explicit_link)
+            res = subprocess.run(
+                [bash, str(cli_scripts / "patch_cli.sh"), str(explicit_link)],
+                env=cli_env, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            assert res.returncode == 11, (res.returncode, res.stdout, res.stderr)
+            assert res.stdout.splitlines() == ["patch-files", str(real_cli.resolve())], res.stdout
+            assert cli_build_count.read_text().strip() == "2"
+            print("PASS: unified patch_cli.sh and patch_cli_linux.sh wrapper checks")
     else:
         print("SKIP: Bash not installed")
