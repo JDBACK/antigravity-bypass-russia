@@ -411,9 +411,22 @@ fn patch_root(root: &Path) -> bool {
 
 const FILES_STEP: (&str, &str) = ("Настраиваем файлы Antigravity", "Файлы Antigravity");
 
+fn is_applicable_target(target: &FoundTarget) -> bool {
+    !(target.kind == crate::core::detector::TargetKind::IdeAsar
+        && crate::core::asar::has_ide_entry(&target.path) == Some(false))
+}
+
 fn patch_targets(targets: Vec<FoundTarget>, steps: &Steps) -> FileSetupOutcome {
-    let paths: Vec<_> = targets.iter().map(|target| target.path.clone()).collect();
-    if !ensure_application_closed(&paths, "настроить файлы") {
+    use crate::core::patcher::{check_target_state, BinaryState};
+    let pending_paths: Vec<_> = targets
+        .iter()
+        .filter(|target| {
+            is_applicable_target(target) && check_target_state(target) != BinaryState::Patched
+        })
+        .map(|target| target.path.clone())
+        .collect();
+    if !pending_paths.is_empty() && !ensure_application_closed(&pending_paths, "настроить файлы")
+    {
         return FileSetupOutcome::Stopped;
     }
     FileSetupOutcome::Completed(run_file_step(steps, FILES_STEP, targets, patch_target))
@@ -761,8 +774,249 @@ pub fn handle_unlock_all() -> bool {
     pause();
     ok
 }
+fn explicit_file_arg() -> Option<String> {
+    crate::system::env::args()
+        .skip(2)
+        .find(|arg| arg != "--prompt-close")
+}
+
+fn prompt_close_requested() -> bool {
+    crate::system::env::args()
+        .skip(2)
+        .any(|arg| arg == "--prompt-close")
+        || std::env::var_os("AGY_PROMPT_CLOSE").is_some_and(|value| value == "1")
+}
+
+#[cfg(unix)]
+fn unix_path_writable(path: &Path) -> bool {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
+}
+
+fn target_is_writable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        if !unix_path_writable(path) {
+            return false;
+        }
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        if !unix_path_writable(parent) {
+            return false;
+        }
+        let mut backups_name = path.file_name().unwrap_or_default().to_os_string();
+        backups_name.push(".ag-backups");
+        let backups_dir = parent.join(backups_name);
+        if backups_dir.exists() {
+            if !unix_path_writable(&backups_dir) {
+                return false;
+            }
+            let current_record = backups_dir.join("current.json");
+            if current_record.exists() && !unix_path_writable(&current_record) {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+pub fn file_operation_needs_admin(restore: bool, explicit_path: Option<&Path>) -> bool {
+    #[cfg(not(unix))]
+    {
+        let _ = (restore, explicit_path);
+        true
+    }
+    #[cfg(unix)]
+    {
+        use crate::core::patcher::{check_target_state, BinaryState};
+        if crate::system::privilege::is_admin() {
+            return false;
+        }
+        let targets = if let Some(path) = explicit_path {
+            find_targets_in_path(&expand_env_vars(&path.to_string_lossy()))
+        } else {
+            find_installation_targets(&find_installations())
+        };
+        let desired = if restore {
+            BinaryState::Stock
+        } else {
+            BinaryState::Patched
+        };
+        let pending: Vec<_> = targets
+            .into_iter()
+            .filter(|target| is_applicable_target(target) && check_target_state(target) != desired)
+            .collect();
+        if pending.is_empty() {
+            return false;
+        }
+        pending
+            .iter()
+            .any(|target| !target_is_writable(&target.path))
+    }
+}
+
+fn active_holders(paths: &[std::path::PathBuf]) -> Result<Vec<String>, String> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::system::file_lock::running_applications(paths).and_then(|mut running| {
+        running.extend(crate::system::file_lock::holders(paths)?);
+        running.sort();
+        running.dedup();
+        Ok(running)
+    })
+}
+
+pub fn handle_inspect_files(arg: Option<&str>) -> bool {
+    use crate::core::detector::TargetKind;
+    use crate::core::patcher::{check_target_state, BinaryState};
+    let as_json = arg == Some("--json");
+    let explicit_root = arg.filter(|value| *value != "--json").map(expand_env_vars);
+    let targets = if let Some(root) = &explicit_root {
+        find_targets_in_path(root)
+    } else {
+        find_installation_targets(&find_installations())
+    };
+    let mut entries = Vec::with_capacity(targets.len());
+    let mut patch_paths = Vec::new();
+    let mut restore_paths = Vec::new();
+    let mut needs_admin_for_patch = false;
+    let mut needs_admin_for_restore = false;
+
+    for target in &targets {
+        if !is_applicable_target(target) {
+            continue;
+        }
+        let state = check_target_state(target);
+        let state_str = match state {
+            BinaryState::Patched => "patched",
+            BinaryState::Stock => "stock",
+            BinaryState::PartiallyPatched => "partial",
+            BinaryState::Unknown => "unknown",
+        };
+        let kind_str = match target.kind {
+            TargetKind::LanguageServer => "antigravity",
+            TargetKind::IdeMainJs | TargetKind::IdeAsar => "ide",
+            TargetKind::AgyCli => "cli",
+        };
+        let needs_patch = state != BinaryState::Patched;
+        let needs_restore = state != BinaryState::Stock;
+        let writable = target_is_writable(&target.path);
+        if needs_patch {
+            patch_paths.push(target.path.clone());
+            if !writable {
+                needs_admin_for_patch = true;
+            }
+        }
+        if needs_restore {
+            restore_paths.push(target.path.clone());
+            if !writable {
+                needs_admin_for_restore = true;
+            }
+        }
+        entries.push(serde_json::json!({
+            "kind": kind_str,
+            "label": component_name(target.kind),
+            "name": target.name,
+            "path": target.path.display().to_string(),
+            "state": state_str,
+            "needs_patch": needs_patch,
+            "needs_restore": needs_restore,
+            "writable": writable,
+        }));
+    }
+
+    let mut holders_error = None;
+    let patch_holders = match active_holders(&patch_paths) {
+        Ok(list) => list,
+        Err(error) => {
+            holders_error = Some(error);
+            Vec::new()
+        }
+    };
+    let restore_holders = match active_holders(&restore_paths) {
+        Ok(list) => list,
+        Err(error) => {
+            if holders_error.is_none() {
+                holders_error = Some(error);
+            }
+            Vec::new()
+        }
+    };
+    let patch_holders_summary = describe_holders(&patch_holders);
+    let restore_holders_summary = describe_holders(&restore_holders);
+
+    if as_json {
+        let payload = serde_json::json!({
+            "targets": entries,
+            "needs_patch_count": patch_paths.len(),
+            "needs_restore_count": restore_paths.len(),
+            "needs_admin_for_patch": needs_admin_for_patch,
+            "needs_admin_for_restore": needs_admin_for_restore,
+            "patch_holders": patch_holders,
+            "patch_holders_summary": patch_holders_summary,
+            "restore_holders": restore_holders,
+            "restore_holders_summary": restore_holders_summary,
+            "holders_error": holders_error,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".into())
+        );
+        return true;
+    }
+
+    let applicable: Vec<_> = targets
+        .iter()
+        .filter(|target| is_applicable_target(target))
+        .collect();
+    if applicable.is_empty() {
+        println!("  Файлы Antigravity не найдены.");
+        return true;
+    }
+    for target in &applicable {
+        let state = match check_target_state(target) {
+            BinaryState::Patched => "настроено",
+            BinaryState::Stock => "не настроено",
+            BinaryState::PartiallyPatched => "настроено частично",
+            BinaryState::Unknown => "нужна проверка",
+        };
+        println!(
+            "  {} {} — {} ({})",
+            style::BULLET,
+            component_name(target.kind),
+            display_path(&target.path),
+            state
+        );
+    }
+    if !patch_holders_summary.is_empty() {
+        println!(
+            "  {} Открыты процессы (блокируют патч): {}",
+            mark(Tone::Warn),
+            patch_holders_summary
+        );
+    }
+    if let Some(error) = holders_error {
+        eprintln!(
+            "  {} Не удалось проверить процессы: {error}",
+            mark(Tone::Warn)
+        );
+    }
+    true
+}
+
 pub fn handle_patch_files_only() -> bool {
-    let ok = if let Some(path) = crate::system::env::args().nth(2) {
+    let ok = if let Some(path) = explicit_file_arg() {
         patch_root(&expand_env_vars(&path))
     } else {
         patch_installations(&Steps::unnumbered()).succeeded()
@@ -772,9 +1026,8 @@ pub fn handle_patch_files_only() -> bool {
     ok
 }
 pub fn handle_restore_files_only() -> bool {
-    let explicit_root = crate::system::env::args()
-        .nth(2)
-        .map(|path| expand_env_vars(&path));
+    use crate::core::patcher::{check_target_state, BinaryState};
+    let explicit_root = explicit_file_arg().map(|path| expand_env_vars(&path));
     let installs = if let Some(root) = &explicit_root {
         if let Err(error) = recover_targets_in_path(root) {
             operation_error("Не удалось восстановить прерванную запись", &error);
@@ -809,11 +1062,25 @@ pub fn handle_restore_files_only() -> bool {
         pause();
         return false;
     }
-    let paths: Vec<_> = targets.iter().map(|target| target.path.clone()).collect();
+    let pending: Vec<_> = targets
+        .into_iter()
+        .filter(|target| {
+            is_applicable_target(target) && check_target_state(target) != BinaryState::Stock
+        })
+        .collect();
+    if pending.is_empty() {
+        println!(
+            "  {} Исходные файлы Antigravity уже восстановлены.",
+            mark(Tone::Ok)
+        );
+        pause();
+        return true;
+    }
+    let paths: Vec<_> = pending.iter().map(|target| target.path.clone()).collect();
     if !ensure_application_closed(&paths, "вернуть исходные файлы") {
         return false;
     }
-    let ok = run_file_step(&Steps::unnumbered(), RESTORE_STEP, targets, restore_target);
+    let ok = run_file_step(&Steps::unnumbered(), RESTORE_STEP, pending, restore_target);
     show_result(ok);
     pause();
     ok
@@ -1170,13 +1437,7 @@ mod holder_tests {
 }
 
 fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool {
-    let running = crate::system::file_lock::running_applications(paths).and_then(|mut running| {
-        running.extend(crate::system::file_lock::holders(paths)?);
-        running.sort();
-        running.dedup();
-        Ok(running)
-    });
-    match running {
+    match active_holders(paths) {
         Ok(holders) if !holders.is_empty() => {
             crate::net::relay::log_event(&format!(
                 "Открытые процессы Antigravity: {}",
@@ -1195,7 +1456,10 @@ fn ensure_application_closed(paths: &[std::path::PathBuf], action: &str) -> bool
                 )
             );
             println!("    Несохранённые изменения будут потеряны — сохраните работу.\n");
-            if crate::system::env::args().len() > 1 {
+            let allow_prompt = crate::system::env::args().len() <= 1
+                || (std::io::IsTerminal::is_terminal(&std::io::stdin())
+                    && prompt_close_requested());
+            if !allow_prompt {
                 print_problem(
                     2,
                     "Antigravity открыт",

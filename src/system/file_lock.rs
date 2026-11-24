@@ -9,7 +9,9 @@ pub fn holders(paths: &[PathBuf]) -> Result<Vec<String>, String> {
 pub fn close_application(paths: &[PathBuf]) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     return crate::system::macos_shutdown::close_application(paths);
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    return linux_close_application(paths);
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
     {
         // Do not kill unrelated installations or a terminal sharing a process
         // name. The caller can ask the user to close the reported holders.
@@ -426,6 +428,135 @@ fn linux_lsof_stderr_is_safe(stderr: &str, paths: &[PathBuf]) -> bool {
     true
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn parse_holder_pid(holder: &str) -> Option<u32> {
+    let (_, tail) = holder.rsplit_once(" (PID ")?;
+    tail.strip_suffix(')')?.parse::<u32>().ok()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn parse_linux_proc_stat(stat: &str) -> Option<(u32, u64)> {
+    let after_comm = stat.rsplit_once(") ")?.1;
+    let mut fields = after_comm.split_whitespace();
+    let _state = fields.next()?;
+    let ppid = fields.next()?.parse::<u32>().ok()?;
+    let starttime = fields.nth(17)?.parse::<u64>().ok()?;
+    Some((ppid, starttime))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_protected_ancestors(
+    current: u32,
+    mut parent_of: impl FnMut(u32) -> Option<u32>,
+) -> Result<std::collections::HashSet<u32>, String> {
+    let mut protected = std::collections::HashSet::new();
+    let mut pid = current;
+    while pid > 1 {
+        if !protected.insert(pid) {
+            return Err("Не удалось проверить цепочку запуска утилиты: цикл PID".into());
+        }
+        pid = parent_of(pid).unwrap_or(1);
+    }
+    protected.insert(1);
+    Ok(protected)
+}
+
+#[cfg(target_os = "linux")]
+fn read_linux_proc_stat(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    parse_linux_proc_stat(&stat)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_close_application(paths: &[PathBuf]) -> Result<(), String> {
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(5);
+    let force_after = Duration::from_secs(3);
+    let mut requested: HashMap<(u32, u64), Instant> = HashMap::new();
+    let mut forced: HashSet<(u32, u64)> = HashSet::new();
+
+    loop {
+        let current = holders(paths)?;
+        if current.is_empty() {
+            return Ok(());
+        }
+
+        let mut pids = Vec::new();
+        for holder in &current {
+            let Some(pid) = parse_holder_pid(holder) else {
+                return Err(format!(
+                    "Файлы Antigravity используются: {}. Завершите эти процессы вручную и повторите.",
+                    current.join(", ")
+                ));
+            };
+            if !pids.contains(&pid) {
+                pids.push(pid);
+            }
+        }
+
+        let protected = linux_protected_ancestors(std::process::id(), |pid| {
+            read_linux_proc_stat(pid).map(|(ppid, _)| ppid)
+        })?;
+        if pids.iter().any(|pid| *pid <= 1 || protected.contains(pid)) {
+            return Err("Утилита запущена из Antigravity. Сохраните работу и запустите утилиту в отдельном терминале, чтобы закрытие не завершило текущую сессию.".into());
+        }
+
+        let now = Instant::now();
+        for pid in pids {
+            let Some((_, starttime)) = read_linux_proc_stat(pid) else {
+                continue;
+            };
+            let identity = (pid, starttime);
+            match requested.get(&identity).copied() {
+                None => {
+                    requested.insert(identity, now);
+                    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                    if rc != 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() != Some(libc::ESRCH) {
+                            return Err(format!("Не удалось завершить PID {pid}: {err}"));
+                        }
+                    }
+                }
+                Some(since) if now.saturating_duration_since(since) >= force_after => {
+                    if forced.insert(identity)
+                        && read_linux_proc_stat(pid).is_some_and(|(_, st)| st == starttime)
+                    {
+                        let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                        if rc != 0 {
+                            let err = std::io::Error::last_os_error();
+                            if err.raw_os_error() != Some(libc::ESRCH) {
+                                return Err(format!(
+                                    "Не удалось принудительно завершить PID {pid}: {err}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            let remaining = holders(paths)?;
+            if remaining.is_empty() {
+                return Ok(());
+            }
+            return Err(format!(
+                "Файлы Antigravity всё ещё используются: {}. Завершите эти процессы и повторите операцию.",
+                remaining.join(", ")
+            ));
+        }
+
+        std::thread::sleep(
+            Duration::from_millis(200).min(timeout.saturating_sub(started.elapsed())),
+        );
+    }
+}
+
 #[cfg(test)]
 mod mac_lock_tests {
     use super::wait_for_holders_to_exit;
@@ -671,6 +802,72 @@ mod mac_lock_tests {
                 .is_empty()
         );
         assert!(super::parse_lsof(Some(1), "", &warnings, &[unrelated, target]).is_err());
+    }
+
+    #[test]
+    fn linux_proc_stat_parser_and_ancestor_protection_handle_edge_cases() {
+        assert_eq!(
+            super::parse_holder_pid("language_server (PID 1540350)"),
+            Some(1540350)
+        );
+        assert_eq!(
+            super::parse_holder_pid("Antigravity Helper (PID 42)"),
+            Some(42)
+        );
+        assert_eq!(super::parse_holder_pid("bad"), None);
+
+        let stat = "1234 (Antigravity (Helper) 2) S 567 1234 567 0 -1 4194304 10 0 0 0 1 2 0 0 20 0 4 0 987654321 100 50";
+        assert_eq!(super::parse_linux_proc_stat(stat), Some((567, 987654321)));
+        assert_eq!(super::parse_linux_proc_stat("malformed"), None);
+
+        let protected = super::linux_protected_ancestors(300, |pid| match pid {
+            300 => Some(200),
+            200 => Some(100),
+            100 => Some(1),
+            _ => None,
+        })
+        .unwrap();
+        assert!(protected.contains(&300));
+        assert!(protected.contains(&200));
+        assert!(protected.contains(&100));
+        assert!(protected.contains(&1));
+        assert!(!protected.contains(&999));
+
+        assert!(super::linux_protected_ancestors(10, |pid| match pid {
+            10 => Some(20),
+            20 => Some(10),
+            _ => None,
+        })
+        .is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_close_application_stops_isolated_holder_and_protects_self() {
+        use std::os::unix::process::CommandExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("holder.bin");
+        std::fs::write(&target, b"fixture").unwrap();
+
+        let _open_self = std::fs::File::open(&target).unwrap();
+        let err = super::linux_close_application(&[target.clone()]).unwrap_err();
+        assert!(err.contains("Antigravity"), "{err}");
+        drop(_open_self);
+
+        let file = std::fs::File::open(&target).unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::from(file))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!super::holders(&[target.clone()]).unwrap().is_empty());
+
+        super::linux_close_application(&[target.clone()]).unwrap();
+        let _ = child.wait();
+        assert!(super::holders(&[target]).unwrap().is_empty());
     }
 
     #[test]

@@ -20,6 +20,9 @@ pub struct FoundTarget {
 
 pub(crate) fn is_agy_cli_name(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
+    if name.starts_with("agy-desktop-") {
+        return false;
+    }
     matches!(
         name.as_str(),
         "agy"
@@ -218,6 +221,8 @@ fn find_installations_with(saved: Vec<PathBuf>) -> Vec<PathBuf> {
             "~/.gemini/antigravity-ide",
             "~/.gemini/antigravity-cli",
             "~/.agy",
+            "~/.antigravity-hub-server/bin",
+            "~/.antigravity-server/bin",
             "/opt/homebrew/Caskroom/antigravity",
             "/opt/homebrew/Caskroom/antigravity-ide",
             "/opt/homebrew/bin",
@@ -288,6 +293,8 @@ fn find_installations_with(saved: Vec<PathBuf>) -> Vec<PathBuf> {
             "~/.gemini/antigravity-ide",
             "~/.gemini/antigravity-cli",
             "~/.agy",
+            "~/.antigravity-hub-server/bin",
+            "~/.antigravity-server/bin",
         ];
         for c in candidates {
             let p = expand_env_vars(c);
@@ -1363,6 +1370,9 @@ mod detection_tests {
         std::fs::write(&cli, cli_fixture(true, false)).unwrap();
         for (name, contents) in [
             ("Antigravity.exe", cli_fixture(false, false)),
+            ("agy-desktop-rtc", cli_fixture(true, false)),
+            ("agy-desktop-helper", cli_fixture(true, false)),
+            ("agy-desktop-script", cli_fixture(true, false)),
             ("agy-fake.exe", cli_fixture(true, true)),
             ("agy-helper.js", cli_fixture(true, false)),
             ("agy-x64.exe.bak", cli_fixture(true, false)),
@@ -1383,6 +1393,21 @@ mod detection_tests {
             cli_files_in_dirs(&[nested]),
             vec![std::fs::canonicalize(cli).unwrap()]
         );
+    }
+
+    #[test]
+    fn hub_server_directory_discovers_language_server_and_skips_bak() {
+        let root = tempfile::tempdir().unwrap();
+        let version_dir = root.path().join("2.35.0-x64");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let ls = version_dir.join("language_server");
+        let bak = version_dir.join("language_server.bak");
+        std::fs::write(&ls, b"\x7fELFdummy").unwrap();
+        std::fs::write(&bak, b"\x7fELFdummy").unwrap();
+        let targets = find_targets_in_path(root.path());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].kind, TargetKind::LanguageServer);
+        assert_eq!(targets[0].path, ls);
     }
 
     fn assert_official_fixture_discovery(variable: &str) {

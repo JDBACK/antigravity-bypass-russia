@@ -45,14 +45,26 @@ pub fn check_single_instance() -> bool {
         use std::fs::OpenOptions;
         use std::os::unix::io::AsRawFd;
 
-        let lock_path = "/tmp/antigravity_bypass_russia.lock";
-        if let Ok(file) = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
-        {
+        let shared_lock = std::path::PathBuf::from("/tmp/antigravity_bypass_russia.lock");
+        let open_lock = |path: &std::path::Path| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+        };
+        let file = match open_lock(&shared_lock) {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                let uid = unsafe { libc::geteuid() };
+                open_lock(&std::path::PathBuf::from(format!(
+                    "/tmp/antigravity_bypass_russia-{uid}.lock"
+                )))
+            }
+            Err(error) => Err(error),
+        };
+        if let Ok(file) = file {
             let fd = file.as_raw_fd();
             let ret = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
             if ret != 0 {

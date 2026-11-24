@@ -13,6 +13,7 @@ fn print_help() {
           unlock        Включить обход (файлы приложения и DNS)\n\
           patch-files   Патч поддерживаемых файлов [необязательный путь]\n\
           restore-files Откат только файлов приложения [необязательный путь]\n\
+          inspect-files Показать найденные файлы и открытые процессы [--json|путь]\n\
           dns           Настройка SmartDNS / NRPT обхода\n\
           tune          Оптимизация сетевого стека TCP (Window Auto-Tuning, 512KB)\n\
           diagnostics   DNS, проверка TLS/сертификата и HTTP (без входа в аккаунт)\n\
@@ -96,6 +97,7 @@ fn main() {
             | "unlock"
             | "patch-files"
             | "restore-files"
+            | "inspect-files"
             | "dns"
             | "rollback"
             | "restore"
@@ -105,22 +107,34 @@ fn main() {
         eprintln!("Неизвестная команда: {command}");
         std::process::exit(2);
     }
-    if args.len()
-        > if matches!(
-            command,
-            "patch-files" | "restore-files" | "rollback" | "restore" | "report"
-        ) {
-            3
-        } else {
-            2
-        }
-    {
+    let positional_args: Vec<&str> = if matches!(command, "patch-files" | "restore-files") {
+        args.iter()
+            .skip(2)
+            .map(String::as_str)
+            .filter(|arg| *arg != "--prompt-close")
+            .collect()
+    } else {
+        args.iter().skip(2).map(String::as_str).collect()
+    };
+    let max_positional = if matches!(
+        command,
+        "patch-files" | "restore-files" | "inspect-files" | "rollback" | "restore" | "report"
+    ) {
+        1
+    } else {
+        0
+    };
+    if positional_args.len() > max_positional {
         eprintln!("Лишние аргументы. См. --help");
         std::process::exit(2);
     }
     if command == "status" {
         ui::dashboard::print_dashboard();
         return;
+    }
+    if command == "inspect-files" {
+        let ok = ui::menu::handle_inspect_files(positional_args.first().copied());
+        std::process::exit(if ok { 0 } else { 1 });
     }
     if command == "speed" {
         std::process::exit(if ui::speed::run() { 0 } else { 1 });
@@ -130,11 +144,24 @@ fn main() {
         std::process::exit(if ok { 0 } else { 1 });
     }
     if command == "report" {
-        let directory = args.get(2).map(std::path::Path::new);
+        let directory = positional_args.first().map(std::path::Path::new);
         let ok = ui::menu::handle_save_diagnostics(directory);
         std::process::exit(if ok { 0 } else { 1 });
     }
-    system::ensure_admin();
+    let needs_admin = match command {
+        "patch-files" => ui::menu::file_operation_needs_admin(
+            false,
+            positional_args.first().map(std::path::Path::new),
+        ),
+        "restore-files" => ui::menu::file_operation_needs_admin(
+            true,
+            positional_args.first().map(std::path::Path::new),
+        ),
+        _ => true,
+    };
+    if needs_admin {
+        system::ensure_admin();
+    }
     if !system::check_single_instance() {
         eprintln!("Уже выполняется другая операция обходчика");
         std::process::exit(1);
