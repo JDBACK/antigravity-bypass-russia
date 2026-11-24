@@ -50,6 +50,40 @@ with tempfile.TemporaryDirectory(prefix="ag wrapper ") as temporary:
 
         cli_wrapper = folder / "patch_cli.ps1"
         shutil.copyfile(ROOT / "scripts" / cli_wrapper.name, cli_wrapper)
+
+        def write_go_buildinfo(pe_path):
+            """Stamp the buildinfo magic into the .data section of a real PE."""
+            data = bytearray(pe_path.read_bytes())
+            pe = int.from_bytes(data[0x3C:0x40], "little")
+            assert data[pe:pe + 4] == b"PE\0\0"
+            count = int.from_bytes(data[pe + 6:pe + 8], "little")
+            opt = int.from_bytes(data[pe + 20:pe + 22], "little")
+            table = pe + 24 + opt
+            for i in range(count):
+                base = table + 40 * i
+                name = bytes(data[base:base + 8]).rstrip(b"\0").decode("ascii")
+                if name == ".data":
+                    raw = int.from_bytes(data[base + 20:base + 24], "little")
+                    magic = b"\xff Go buildinf:" + bytes([8, 0])
+                    data[raw:raw + len(magic)] = magic
+                    pe_path.write_bytes(data)
+                    return
+            raise AssertionError("no .data section in fixture PE")
+
+        fakebin = Path(temporary) / "cli-bin with space"
+        fakebin.mkdir()
+        go_cli = fakebin / "agy.exe"
+        shutil.copyfile(binary, go_cli)
+        write_go_buildinfo(go_cli)
+        not_go_cli = fakebin / "antigravity.exe"
+        shutil.copyfile(binary, not_go_cli)
+
+        # A cargo stub that echoes its arguments and fails, to prove a rebuild
+        # invokes the toolchain without a real Rust installation.
+        stubdir = Path(temporary) / "fake-toolchain"
+        stubdir.mkdir()
+        shutil.copyfile(binary, stubdir / "cargo.exe")
+
         for shell_name in ["powershell.exe", "pwsh.exe"]:
             shell = shutil.which(shell_name)
             if not shell:
@@ -65,12 +99,66 @@ with tempfile.TemporaryDirectory(prefix="ag wrapper ") as temporary:
                           "-File", str(cli_wrapper), "--status"])
             assert result.returncode == 19, (shell_name, result.returncode, result.stdout, result.stderr)
             assert "stale engine" in result.stdout, result.stdout
+            # Unknown option exits 2 without a PowerShell error record.
+            result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(cli_wrapper), "--bogus"])
+            assert result.returncode == 2, (shell_name, result.returncode, result.stdout, result.stderr)
+            assert "FullyQualifiedErrorId" not in result.stderr, result.stderr
             # With no CLI installed, a friendly error, not a stack trace.
             result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                           "-File", str(cli_wrapper)])
             assert result.returncode == 1, (shell_name, result.returncode, result.stdout, result.stderr)
             assert "CLI" in result.stderr, (result.stdout, result.stderr)
-            print(f"PASS: {shell_name} patch_cli.ps1 parses, resolves engine, reports missing CLI")
+            # Explicit path: --restore reaches the engine and passes its code.
+            result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(cli_wrapper), "--restore", str(not_go_cli)])
+            assert result.returncode == 19, (shell_name, result.returncode, result.stdout, result.stderr)
+            assert "stale engine" in result.stdout, result.stdout
+            # PATH discovery: the Go-marked PE resolves (non-Go sibling is skipped).
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = str(fakebin) + os.pathsep + old_path
+            try:
+                result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                              "-File", str(cli_wrapper)])
+                assert result.returncode == 19, (shell_name, result.returncode, result.stdout, result.stderr)
+                assert "stale engine" in result.stdout, result.stdout
+            finally:
+                os.environ["PATH"] = old_path
+            # Non-Go PE alone is skipped and reports "not found".
+            only_nongo = Path(temporary) / "only-nongo"
+            only_nongo.mkdir(exist_ok=True)
+            shutil.copyfile(not_go_cli, only_nongo / "agy.exe")
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = str(only_nongo) + os.pathsep + old_path
+            try:
+                result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                              "-File", str(cli_wrapper)])
+                assert result.returncode == 1, (shell_name, result.returncode, result.stdout, result.stderr)
+            finally:
+                os.environ["PATH"] = old_path
+            # A source file newer than the engine triggers an incremental
+            # rebuild; the cargo stub exits 7 after echoing "build".
+            srcdir = Path(temporary) / "src"
+            srcdir.mkdir(exist_ok=True)
+            source_file = srcdir / "main.rs"
+            source_file.write_text("// fixture\n", encoding="utf-8")
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = str(stubdir) + os.pathsep + old_path
+            try:
+                result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                              "-File", str(cli_wrapper), "--status"])
+                assert result.returncode == 7, (shell_name, result.returncode, result.stdout, result.stderr)
+                assert "6275696c64" in result.stdout, result.stdout  # hex("build")
+                # --rebuild forces a toolchain invocation even without changes.
+                result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                              "-File", str(cli_wrapper), "--status", "--rebuild"])
+                assert result.returncode == 7, (shell_name, result.returncode, result.stdout, result.stderr)
+                assert "6275696c64" in result.stdout, result.stdout
+            finally:
+                os.environ["PATH"] = old_path
+            source_file.unlink()
+            srcdir.rmdir()
+            print(f"PASS: {shell_name} patch_cli.ps1 full wrapper checks")
 
     bash = str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe") if os.name == "nt" else shutil.which("bash")
     if bash and Path(bash).is_file():
