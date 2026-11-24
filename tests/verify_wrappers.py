@@ -48,6 +48,30 @@ with tempfile.TemporaryDirectory(prefix="ag wrapper ") as temporary:
             assert result.stdout.splitlines() == [a.encode("utf-8").hex() for a in ARGUMENTS], (shell_name, result.stdout)
             print(f"PASS: {shell_name} preserves arguments and failure exit code")
 
+        cli_wrapper = folder / "patch_cli.ps1"
+        shutil.copyfile(ROOT / "scripts" / cli_wrapper.name, cli_wrapper)
+        for shell_name in ["powershell.exe", "pwsh.exe"]:
+            shell = shutil.which(shell_name)
+            if not shell:
+                continue
+            # --help must parse and exit cleanly.
+            result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(cli_wrapper), "--help"])
+            assert result.returncode == 0, (shell_name, result.returncode, result.stdout, result.stderr)
+            assert "patch-files" in result.stdout, result.stdout
+            # --status resolves the adjacent repository build (the stale
+            # engine fixture exits 19) and passes its exit code through.
+            result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(cli_wrapper), "--status"])
+            assert result.returncode == 19, (shell_name, result.returncode, result.stdout, result.stderr)
+            assert "stale engine" in result.stdout, result.stdout
+            # With no CLI installed, a friendly error, not a stack trace.
+            result = run([shell, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                          "-File", str(cli_wrapper)])
+            assert result.returncode == 1, (shell_name, result.returncode, result.stdout, result.stderr)
+            assert "CLI" in result.stderr, (result.stdout, result.stderr)
+            print(f"PASS: {shell_name} patch_cli.ps1 parses, resolves engine, reports missing CLI")
+
     bash = str(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe") if os.name == "nt" else shutil.which("bash")
     if bash and Path(bash).is_file():
         wrapper = folder / "unlock_and_restore.sh"
