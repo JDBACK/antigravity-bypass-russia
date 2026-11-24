@@ -5,6 +5,7 @@ pub struct Egress {
     pub vpn_active: bool,
 }
 
+#[cfg(windows)]
 const VPN_KEYWORDS: &[&str] = &[
     "wireguard",
     "wintun",
@@ -30,234 +31,10 @@ const VPN_KEYWORDS: &[&str] = &[
     "wintun",
 ];
 
+#[cfg(windows)]
 fn descr_is_vpn(descr: &str) -> bool {
     let d = descr.to_lowercase();
     VPN_KEYWORDS.iter().any(|k| d.contains(k))
-}
-
-/// Read-only preflight; call before patching files or changing network state.
-pub fn ensure_tun_disabled() -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let adapters = active_virtual_adapters()?;
-        if adapters.iter().any(|name| is_active_tun_name(name)) {
-            return Err("Обнаружен включённый TUN. Выключите VPN и режим TUN в VPN-клиенте, затем повторите включение обхода.".into());
-        }
-        // Also catches unfamiliar TUN clients whose DNS protection remains on.
-        if !super::relay::local_dns_available()? {
-            return Err("Локальный DNS заблокирован. Выключите VPN вместе с режимом TUN, затем повторите включение обхода.".into());
-        }
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let egress = detect().ok_or("Не удалось определить подключение к интернету. Проверьте сеть и повторите включение обхода.")?;
-        if egress.vpn_active {
-            return Err("Выключите VPN и режим TUN, затем повторите включение обхода.".into());
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-const TUN_ADAPTER_QUERY: &str = r#"
-[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)
-$ErrorActionPreference='Stop'
-try {
-    ConvertTo-Json -Compress -InputObject @(Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and -not $_.HardwareInterface } | ForEach-Object { $_.Name + '|' + $_.InterfaceDescription })
-} catch {
-    [Console]::Error.WriteLine($_.Exception.Message)
-    exit 1
-}
-"#;
-
-#[cfg(windows)]
-fn active_virtual_adapters() -> Result<Vec<String>, String> {
-    let output = crate::system::powershell::output(TUN_ADAPTER_QUERY)
-        .map_err(|e| format!("Не удалось запустить Windows PowerShell для проверки TUN: {e}"))?;
-    parse_tun_adapters(output)
-}
-
-#[cfg(windows)]
-fn parse_tun_adapters(output: std::process::Output) -> Result<Vec<String>, String> {
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "Не удалось проверить сетевые адаптеры через Windows PowerShell ({}): {}",
-            output.status,
-            detail.trim()
-        ));
-    }
-    // A failed or empty query is not evidence that TUN is disabled.
-    serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Некорректный ответ Windows PowerShell при проверке TUN: {e}"))
-}
-
-#[cfg(any(windows, test))]
-fn is_active_tun_name(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    // An always-on overlay alone (e.g. Tailscale) is not evidence of TUN
-    // interception. Port-53 protection is checked separately above.
-    if name.contains("tailscale") || name.contains("zerotier") {
-        return false;
-    }
-    [
-        "sing-tun",
-        "throne",
-        "wintun",
-        "wireguard",
-        "tap-windows",
-        "tap-win",
-        "openvpn",
-        "tun2socks",
-        "clash",
-        "mihomo",
-        "warp",
-        "nordlynx",
-        "proton",
-        "outline",
-    ]
-    .iter()
-    .any(|pattern| name.contains(pattern))
-        || name
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|part| part == "tun")
-}
-
-#[cfg(test)]
-mod tun_preflight_tests {
-    #[test]
-    fn detects_throne_and_tun_clients_but_not_unrelated_overlays() {
-        for name in [
-            "throne-tun|sing-tun Tunnel",
-            "VPN|Wintun Userspace Tunnel",
-            "tun0|WireGuard Tunnel",
-            "tun|VPN Adapter",
-        ] {
-            assert!(super::is_active_tun_name(name), "{name}");
-        }
-        for name in [
-            "Tailscale|Tailscale Tunnel",
-            "ZeroTier One",
-            "Ethernet|Realtek",
-            "vEthernet|Hyper-V Virtual Ethernet Adapter",
-        ] {
-            assert!(!super::is_active_tun_name(name), "{name}");
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn queries_adapters_without_path_and_ignores_shadow_powershell() {
-        use crate::system::{powershell, process::no_window};
-        use std::{
-            process::Command,
-            time::{Duration, Instant},
-        };
-
-        const CHILD: &str = "ABR_TEST_POWERSHELL_ENVIRONMENT";
-        if let Ok(mode) = std::env::var(CHILD) {
-            if mode != "shadow" {
-                // Reproduce issue #6 in an isolated process. Setting PATH on
-                // only the PowerShell child leaves Rust's parent-PATH fallback.
-                let error = no_window(&mut Command::new("powershell.exe"))
-                    .args(["-NoProfile", "-NonInteractive", "-Command", "exit 0"])
-                    .output()
-                    .unwrap_err();
-                assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-                assert_eq!(error.to_string(), "program not found");
-            }
-            let executable = powershell::executable().unwrap();
-            assert!(executable.is_absolute());
-            assert!(!executable.starts_with(std::env::current_dir().unwrap()));
-            // Actual read-only NetAdapter query, without patching or binding DNS.
-            super::active_virtual_adapters().unwrap();
-            return;
-        }
-
-        for mode in ["empty", "unset", "shadow"] {
-            let directory = tempfile::Builder::new()
-                .prefix("tun query путь ")
-                .tempdir()
-                .unwrap();
-            if mode == "shadow" {
-                std::fs::write(
-                    directory.path().join("powershell.exe"),
-                    b"not an executable",
-                )
-                .unwrap();
-            }
-            let mut cmd = Command::new(std::env::current_exe().unwrap());
-            no_window(&mut cmd);
-            cmd.args(["--exact", "net::egress::tun_preflight_tests::queries_adapters_without_path_and_ignores_shadow_powershell", "--nocapture"])
-                .env(CHILD, mode).current_dir(directory.path());
-            match mode {
-                "unset" => {
-                    cmd.env_remove("PATH");
-                }
-                "shadow" => {
-                    cmd.env("PATH", directory.path());
-                }
-                _ => {
-                    cmd.env("PATH", "");
-                }
-            }
-            let mut child = cmd.spawn().unwrap();
-            let started = Instant::now();
-            loop {
-                if let Some(status) = child.try_wait().unwrap() {
-                    assert!(status.success(), "{mode}: {status}");
-                    break;
-                }
-                if started.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("{mode}: adapter query timed out");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn adapter_query_handles_empty_lists_unicode_and_query_failures() {
-        fn query(body: &str) -> Result<Vec<String>, String> {
-            let script = format!(
-                "function Get-NetAdapter {{ {body} }}\n{}",
-                super::TUN_ADAPTER_QUERY
-            );
-            let output = crate::system::powershell::command()
-                .unwrap()
-                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-                .output()
-                .unwrap();
-            super::parse_tun_adapters(output)
-        }
-        assert!(query("return @()").unwrap().is_empty());
-        assert_eq!(query("[pscustomobject]@{Name='Сеть';InterfaceDescription='Wintun';Status='Up';HardwareInterface=$false}").unwrap(), ["Сеть|Wintun"]);
-        assert_eq!(query(r#"
-            [pscustomobject]@{Name='Ethernet';InterfaceDescription='Realtek';Status='Up';HardwareInterface=$true}
-            [pscustomobject]@{Name='VPN';InterfaceDescription='Wintun';Status='Disconnected';HardwareInterface=$false}
-            [pscustomobject]@{Name='Сеть';InterfaceDescription='WireGuard';Status='Up';HardwareInterface=$false}
-            [pscustomobject]@{Name='throne-tun';InterfaceDescription='sing-tun';Status='Up';HardwareInterface=$false}
-        "#).unwrap(), ["Сеть|WireGuard", "throne-tun|sing-tun"]);
-        let error = query("throw 'Ошибка службы адаптеров'").unwrap_err();
-        assert!(error.contains("Ошибка службы адаптеров"), "{error}");
-        assert!(!error.contains("Выключите VPN"), "{error}");
-        for response in ["", "not json"] {
-            let output = crate::system::powershell::command()
-                .unwrap()
-                .args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-Command",
-                    &format!("Write-Output '{response}'"),
-                ])
-                .output()
-                .unwrap();
-            assert!(super::parse_tun_adapters(output).is_err());
-        }
-    }
 }
 
 #[cfg(target_os = "windows")]
@@ -308,6 +85,143 @@ fn if_entry_meta(if_index: u32) -> Option<(u32, String)> {
     Some((row.dw_type, descr))
 }
 
+/// Adapter description fragments excluded from the physical route search.
+/// Kept identical to the former `Get-NetAdapter` filters.
+#[cfg(any(windows, test))]
+const NON_PHYSICAL_DESCRIPTIONS: &[&str] = &[
+    "wireguard",
+    "tap",
+    "wintun",
+    "openvpn",
+    "tailscale",
+    "cisco",
+    "globalprotect",
+    "pangp",
+    "zerotier",
+    "hamachi",
+    "cloudflare",
+    "warp",
+    "nordlynx",
+    "proton",
+    "outline",
+    "softether",
+    "tun2socks",
+    "hyper-v",
+    "vmware",
+    "virtualbox",
+    "wsl",
+];
+
+#[cfg(any(windows, test))]
+struct AdapterInfo {
+    index: u32,
+    up: bool,
+    hardware: bool,
+    description: String,
+}
+
+#[cfg(any(windows, test))]
+struct DefaultRoute {
+    index: u32,
+    next_hop: std::net::Ipv4Addr,
+    metric: u32,
+}
+
+/// The lowest-metric IPv4 default route with a gateway on an up, hardware,
+/// non-tunnel adapter. Equal metrics keep the routing table order.
+#[cfg(any(windows, test))]
+fn pick_physical_route(adapters: &[AdapterInfo], routes: &[DefaultRoute]) -> Option<(u32, String)> {
+    let physical = |index: u32| {
+        adapters.iter().any(|adapter| {
+            let description = adapter.description.to_lowercase();
+            adapter.index == index
+                && adapter.up
+                && adapter.hardware
+                && !NON_PHYSICAL_DESCRIPTIONS
+                    .iter()
+                    .any(|fragment| description.contains(fragment))
+        })
+    };
+    routes
+        .iter()
+        .filter(|route| !route.next_hop.is_unspecified() && physical(route.index))
+        .min_by_key(|route| route.metric)
+        .map(|route| (route.index, route.next_hop.to_string()))
+}
+
+/// Native replacement for `Get-NetAdapter`/`Get-NetRoute`. The relay runs this
+/// whenever a VPN owns the default route, so it must not start PowerShell.
+#[cfg(windows)]
+fn physical_default_route() -> Option<(u32, String)> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, GetIpForwardTable2, MIB_IF_ROW2, MIB_IF_TABLE2,
+        MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    const HARDWARE_INTERFACE: u8 = 0b01;
+    const FILTER_INTERFACE: u8 = 0b10;
+
+    let mut adapters = Vec::new();
+    unsafe {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        if GetIfTable2(&mut table) != 0 || table.is_null() {
+            return None;
+        }
+        let rows = std::slice::from_raw_parts(
+            std::ptr::addr_of!((*table).Table).cast::<MIB_IF_ROW2>(),
+            (*table).NumEntries as usize,
+        );
+        for row in rows {
+            let flags = row.InterfaceAndOperStatusFlags._bitfield;
+            let length = row
+                .Description
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(row.Description.len());
+            adapters.push(AdapterInfo {
+                index: row.InterfaceIndex,
+                up: row.OperStatus == IfOperStatusUp,
+                // NDIS filter instances repeat the adapter description.
+                hardware: flags & HARDWARE_INTERFACE != 0 && flags & FILTER_INTERFACE == 0,
+                description: String::from_utf16_lossy(&row.Description[..length]),
+            });
+        }
+        FreeMibTable(table.cast());
+    }
+
+    let mut routes = Vec::new();
+    unsafe {
+        let mut table: *mut MIB_IPFORWARD_TABLE2 = std::ptr::null_mut();
+        if GetIpForwardTable2(AF_INET, &mut table) != 0 || table.is_null() {
+            return None;
+        }
+        let rows = std::slice::from_raw_parts(
+            std::ptr::addr_of!((*table).Table).cast::<MIB_IPFORWARD_ROW2>(),
+            (*table).NumEntries as usize,
+        );
+        for row in rows {
+            let prefix = &row.DestinationPrefix;
+            if prefix.PrefixLength != 0
+                || prefix.Prefix.si_family != AF_INET
+                || prefix.Prefix.Ipv4.sin_addr.S_un.S_addr != 0
+                || row.NextHop.si_family != AF_INET
+            {
+                continue;
+            }
+            routes.push(DefaultRoute {
+                index: row.InterfaceIndex,
+                next_hop: std::net::Ipv4Addr::from(
+                    row.NextHop.Ipv4.sin_addr.S_un.S_addr.to_ne_bytes(),
+                ),
+                metric: row.Metric,
+            });
+        }
+        FreeMibTable(table.cast());
+    }
+    pick_physical_route(&adapters, &routes)
+}
+
 #[cfg(target_os = "windows")]
 fn is_vpn_iface(if_index: u32) -> bool {
     const IF_TYPE_PPP: u32 = 23;
@@ -324,7 +238,33 @@ fn is_vpn_iface(if_index: u32) -> bool {
     }
 }
 
+#[cfg(windows)]
+pub(super) fn windows_ipv4_route(address: std::net::Ipv4Addr) -> Option<u32> {
+    #[link(name = "iphlpapi")]
+    extern "system" {
+        fn GetBestInterface(address: u32, interface: *mut u32) -> u32;
+    }
+    let mut index = 0;
+    let address = u32::from_ne_bytes(address.octets());
+    (unsafe { GetBestInterface(address, &mut index) } == 0 && index != 0).then_some(index)
+}
+
+#[cfg(windows)]
+pub(super) fn windows_vpn_route() -> Option<u32> {
+    // Look at the default internet path, rather than an installed adapter name.
+    windows_ipv4_route([1, 1, 1, 1].into()).filter(|&index| {
+        is_vpn_iface(index)
+            && if_entry_meta(index).is_some_and(|(_, descr)| {
+                let descr = descr.to_ascii_lowercase();
+                !["tailscale", "zerotier", "hyper-v", "virtualbox", "vmware"]
+                    .iter()
+                    .any(|overlay| descr.contains(overlay))
+            })
+    })
+}
+
 /// Physical default route (skips VPN adapters). Used for pinning Xbox-DNS /32 routes.
+#[cfg(not(target_os = "macos"))]
 pub fn detect_physical() -> Option<(u32, String)> {
     #[cfg(target_os = "windows")]
     {
@@ -376,30 +316,8 @@ pub fn detect_physical() -> Option<(u32, String)> {
             return native;
         }
 
-        let ps = r#"
-$vpn = 'WireGuard|TAP|Wintun|OpenVPN|Tailscale|Cisco|GlobalProtect|PANGP|ZeroTier|Hamachi|Cloudflare|WARP|NordLynx|Proton|Outline|SoftEther|tun2socks'
-$phys = @(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object {
-    $_.Status -eq 'Up' -and $_.HardwareInterface -and $_.InterfaceDescription -notmatch $vpn -and $_.InterfaceDescription -notmatch 'Hyper-V|VMware|VirtualBox|WSL'
-} | ForEach-Object { $_.ifIndex })
-$def = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
-$mine = @($def | Where-Object { $phys -contains $_.ifIndex -and $_.NextHop -ne '0.0.0.0' })
-if ($mine.Count -gt 0) {
-    $best = $mine | Sort-Object { [int]$_.RouteMetric } | Select-Object -First 1
-    Write-Output ("{0}|{1}" -f $best.ifIndex, $best.NextHop)
-}
-"#;
-        let out = crate::system::powershell::output(ps).ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if let Some((idx, gw)) = s.split_once('|') {
-            if let Ok(i) = idx.trim().parse::<u32>() {
-                let gw = gw.trim().to_string();
-                if i > 0 && !gw.is_empty() && gw != "0.0.0.0" {
-                    return Some((i, gw));
-                }
-            }
+        if let Some(found) = physical_default_route() {
+            return Some(found);
         }
 
         #[repr(C)]
@@ -520,15 +438,8 @@ if ($mine.Count -gt 0) {
 pub fn detect() -> Option<Egress> {
     #[cfg(target_os = "windows")]
     {
-        #[link(name = "iphlpapi")]
-        extern "system" {
-            fn GetBestInterface(dwDestAddr: u32, pdwBestIfIndex: *mut u32) -> u32;
-        }
-
-        let mut if_index: u32 = 0;
-        let dest: u32 = u32::from_ne_bytes([8, 8, 8, 8]);
-        let res = unsafe { GetBestInterface(dest, &mut if_index) };
-        let default_vpn = res == 0 && if_index > 0 && is_vpn_iface(if_index);
+        let if_index = windows_ipv4_route([8, 8, 8, 8].into()).unwrap_or(0);
+        let default_vpn = if_index > 0 && is_vpn_iface(if_index);
 
         if let Some((phys, gw)) = detect_physical() {
             return Some(Egress {
@@ -538,7 +449,7 @@ pub fn detect() -> Option<Egress> {
             });
         }
 
-        if res == 0 && if_index > 0 {
+        if if_index > 0 {
             return Some(Egress {
                 if_index,
                 gateway: None,
@@ -646,4 +557,66 @@ pub fn detect() -> Option<Egress> {
 
     #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter(index: u32, description: &str) -> AdapterInfo {
+        AdapterInfo {
+            index,
+            up: true,
+            hardware: true,
+            description: description.into(),
+        }
+    }
+
+    fn route(index: u32, next_hop: [u8; 4], metric: u32) -> DefaultRoute {
+        DefaultRoute {
+            index,
+            next_hop: next_hop.into(),
+            metric,
+        }
+    }
+
+    #[test]
+    fn physical_route_skips_tunnels_virtual_and_down_adapters() {
+        let mut down = adapter(4, "Intel(R) Ethernet Connection");
+        down.up = false;
+        let mut software = adapter(5, "Microsoft Loopback Adapter");
+        software.hardware = false;
+        let adapters = [
+            adapter(7, "Realtek PCIe GbE Family Controller"),
+            adapter(9, "Intel(R) Wi-Fi 6 AX201 160MHz"),
+            adapter(11, "WireGuard Tunnel"),
+            adapter(12, "Hyper-V Virtual Ethernet Adapter"),
+            down,
+            software,
+        ];
+        let routes = [
+            route(11, [10, 0, 0, 1], 0),
+            route(12, [172, 16, 0, 1], 1),
+            route(4, [192, 168, 0, 1], 2),
+            route(5, [192, 168, 5, 1], 3),
+            route(9, [0, 0, 0, 0], 5),
+            route(9, [192, 168, 1, 1], 35),
+            route(7, [192, 168, 2, 1], 25),
+        ];
+        assert_eq!(
+            pick_physical_route(&adapters, &routes),
+            Some((7, "192.168.2.1".into()))
+        );
+        assert_eq!(pick_physical_route(&adapters, &routes[..5]), None);
+    }
+
+    #[test]
+    fn equal_metrics_keep_routing_table_order() {
+        let adapters = [adapter(3, "Ethernet"), adapter(8, "Wi-Fi")];
+        let routes = [route(8, [192, 168, 1, 1], 10), route(3, [10, 1, 1, 1], 10)];
+        assert_eq!(
+            pick_physical_route(&adapters, &routes),
+            Some((8, "192.168.1.1".into()))
+        );
+    }
 }

@@ -1,15 +1,28 @@
+#[cfg(windows)]
 use serde::{Deserialize, Serialize};
-use std::{fs, net::Ipv4Addr, path::PathBuf};
+use std::net::Ipv4Addr;
+#[cfg(windows)]
+use std::{fs, path::PathBuf};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RoutePolicy {
+    Physical,
+    #[cfg(windows)]
+    System,
+}
+
+#[cfg(windows)]
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct OwnedRoute {
     ip: Ipv4Addr,
     gateway: Ipv4Addr,
     interface: u32,
 }
+#[cfg(windows)]
 fn state_path() -> PathBuf {
     super::relay::log_dir().join("owned_routes.json")
 }
+#[cfg(windows)]
 fn load() -> Result<Vec<OwnedRoute>, String> {
     match fs::read(state_path()) {
         Ok(b) => serde_json::from_slice(&b).map_err(|e| format!("Журнал маршрутов: {e}")),
@@ -17,6 +30,7 @@ fn load() -> Result<Vec<OwnedRoute>, String> {
         Err(e) => Err(e.to_string()),
     }
 }
+#[cfg(windows)]
 fn save(routes: &[OwnedRoute]) -> Result<(), String> {
     fs::create_dir_all(super::relay::log_dir()).map_err(|e| e.to_string())?;
     crate::system::fs_utils::robust_write_file(
@@ -52,15 +66,138 @@ fn powershell(script: &str) -> Result<String, String> {
 }
 pub fn sync_physical_hosts(extra: &[Ipv4Addr]) -> Result<(), String> {
     #[cfg(target_os = "windows")]
-    {
-        let (interface, gateway) =
-            super::egress::detect_physical().ok_or("Не найден физический адаптер")?;
-        let gateway: Ipv4Addr = gateway.parse().map_err(|_| "Некорректный шлюз")?;
-        sync_physical_hosts_on(interface, gateway, extra)?;
-    }
+    return prepare_probe_routes(extra, &mut Vec::new());
     #[cfg(not(target_os = "windows"))]
-    let _ = extra;
+    {
+        let _ = extra;
+        Ok(())
+    }
+}
+
+/// Setup holds the configuration lock while staging routes for its probes.
+/// A rejected ranking must not leave those routes installed or retire old ones.
+pub(super) fn with_probe_routes<T>(
+    policy: RoutePolicy,
+    probe: impl FnOnce(&mut dyn FnMut(&[Ipv4Addr]) -> Result<(), String>) -> Result<T, String>,
+) -> Result<T, String> {
+    #[cfg(windows)]
+    {
+        let path = state_path();
+        let previous = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut changes = Vec::new();
+        let result = match policy {
+            RoutePolicy::Physical => probe(&mut |ips| prepare_probe_routes(ips, &mut changes)),
+            RoutePolicy::System => {
+                release_owned_routes(&mut changes).and_then(|()| probe(&mut |_| Ok(())))
+            }
+        };
+        if let Err(error) = result {
+            let rollback = restore_probe_routes(&path, previous, &changes, |script| {
+                powershell(script).map(|_| ())
+            });
+            return match rollback {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(format!(
+                    "{error}. Не удалось восстановить маршруты: {rollback_error}"
+                )),
+            };
+        }
+        result
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = policy;
+        probe(&mut sync_physical_hosts)
+    }
+}
+
+#[cfg(windows)]
+fn release_owned_routes(changes: &mut Vec<RouteChange>) -> Result<(), String> {
+    let owned = load()?;
+    if !owned.is_empty() {
+        remove_recorded_routes(&owned, changes, powershell)?;
+        save(&[])?;
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+fn remove_recorded_routes(
+    routes: &[OwnedRoute],
+    changes: &mut Vec<RouteChange>,
+    mut run: impl FnMut(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    for route in routes {
+        if run(&remove_route_script(route))? == "removed" {
+            changes.push(RouteChange::Removed(route.clone()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+enum RouteChange {
+    Added(OwnedRoute),
+    Removed(OwnedRoute),
+}
+
+#[cfg(windows)]
+fn restore_probe_routes(
+    journal: &std::path::Path,
+    previous: Option<Vec<u8>>,
+    changes: &[RouteChange],
+    run: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    undo_probe_routes(changes, run)?;
+    match previous {
+        Some(bytes) if fs::read(journal).ok().as_ref() != Some(&bytes) => {
+            crate::system::fs_utils::robust_write_file(journal, &bytes)
+        }
+        None => match fs::remove_file(journal) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.to_string()),
+        },
+        _ => Ok(()),
+    }
+}
+
+#[cfg(windows)]
+fn undo_probe_routes(
+    changes: &[RouteChange],
+    mut run: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for change in changes.iter().rev() {
+        let script = match change {
+            RouteChange::Added(route) => remove_route_script(route),
+            RouteChange::Removed(route) => format!(
+                "{}; if ($ownedMatches.Count -eq 0) {{ {} }}",
+                exact_route_query(route),
+                add_route_script(route)
+            ),
+        };
+        if let Err(error) = run(&script) {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+#[cfg(windows)]
+fn prepare_probe_routes(extra: &[Ipv4Addr], changes: &mut Vec<RouteChange>) -> Result<(), String> {
+    let (interface, gateway) =
+        super::egress::detect_physical().ok_or("Не найден физический адаптер")?;
+    let gateway: Ipv4Addr = gateway.parse().map_err(|_| "Некорректный шлюз")?;
+    sync_physical_hosts_on(interface, gateway, extra, changes)
 }
 
 /// ActiveStore is cleared at boot. Rebuild the recorded destinations against
@@ -70,7 +207,7 @@ pub(super) fn restore_recorded_routes(interface: u32, gateway: Ipv4Addr) -> Resu
     let owned = load()?;
     if !owned.is_empty() {
         let destinations: Vec<_> = owned.iter().map(|route| route.ip).collect();
-        sync_physical_hosts_on(interface, gateway, &destinations)?;
+        sync_physical_hosts_on(interface, gateway, &destinations, &mut Vec::new())?;
     }
     Ok(())
 }
@@ -80,6 +217,7 @@ fn sync_physical_hosts_on(
     interface: u32,
     gateway: Ipv4Addr,
     extra: &[Ipv4Addr],
+    changes: &mut Vec<RouteChange>,
 ) -> Result<(), String> {
     if interface == 0 || gateway.is_unspecified() {
         return Err("Не найден физический выход в интернет".into());
@@ -120,7 +258,9 @@ fn sync_physical_hosts_on(
                     .cloned()
                     .collect();
                 for old in retired {
-                    powershell(&remove_route_script(&old))?;
+                    if powershell(&remove_route_script(&old))? == "removed" {
+                        changes.push(RouteChange::Removed(old.clone()));
+                    }
                     owned.retain(|r| r != &old);
                     save(&owned)?;
                 }
@@ -132,7 +272,8 @@ fn sync_physical_hosts_on(
             owned.push(route.clone());
             save(&owned)?;
         }
-        powershell(&format!("$ErrorActionPreference='Stop'; New-NetRoute -DestinationPrefix '{ip}/32' -InterfaceIndex {interface} -NextHop '{gateway}' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null"))?;
+        powershell(&add_route_script(&route))?;
+        changes.push(RouteChange::Added(route));
     }
     Ok(())
 }
@@ -156,36 +297,67 @@ fn inspect_route_script(route: &OwnedRoute, owned: &[OwnedRoute]) -> String {
     };
     format!("$r=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{}/32' }}); if ($r.Count -eq 0) {{ 'missing' }} elseif (@($r | Where-Object {{ $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' }}).Count -gt 0) {{ 'present' }} elseif (@($r | Where-Object {{ -not ({tracked}) }}).Count -eq 0) {{ 'owned-stale' }} else {{ 'foreign' }}", route.ip, route.interface, route.gateway)
 }
-pub fn add_static_routes() -> Result<(), String> {
-    sync_physical_hosts(&[])
+#[cfg(windows)]
+fn add_route_script(route: &OwnedRoute) -> String {
+    format!("New-NetRoute -DestinationPrefix '{}/32' -InterfaceIndex {} -NextHop '{}' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null", route.ip, route.interface, route.gateway)
 }
+#[cfg(windows)]
 pub fn remove_static_routes() -> Result<(), String> {
-    #[cfg(target_os = "windows")]
-    {
-        let owned = load()?;
-        let mut remaining = owned.clone();
-        for route in owned {
-            powershell(&remove_route_script(&route))?;
-            remaining.retain(|r| r != &route);
-            save(&remaining)?;
-        }
-        if state_path().exists() {
-            fs::remove_file(state_path()).map_err(|e| e.to_string())?;
-        }
+    let owned = load()?;
+    let mut remaining = owned.clone();
+    for route in owned {
+        powershell(&remove_route_script(&route))?;
+        remaining.retain(|r| r != &route);
+        save(&remaining)?;
+    }
+    if state_path().exists() {
+        fs::remove_file(state_path()).map_err(|e| e.to_string())?;
     }
     Ok(())
 }
 
 #[cfg(windows)]
-fn remove_route_script(route: &OwnedRoute) -> String {
+fn exact_route_query(route: &OwnedRoute) -> String {
     // Query the table first: an absent exact-prefix query is a CIM error even
     // with SilentlyContinue, and can make powershell.exe return exit code 1.
-    format!("$ownedMatches=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{}/32' -and $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' -and $_.RouteMetric -eq 1 }}); foreach ($ownedMatch in $ownedMatches) {{ $ownedMatch | Remove-NetRoute -Confirm:$false -ErrorAction Stop }}", route.ip, route.interface, route.gateway)
+    format!("$ownedMatches=@(Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction Stop | Where-Object {{ $_.DestinationPrefix -eq '{}/32' -and $_.InterfaceIndex -eq {} -and $_.NextHop -eq '{}' -and $_.RouteMetric -eq 1 }})", route.ip, route.interface, route.gateway)
+}
+
+#[cfg(windows)]
+fn remove_route_script(route: &OwnedRoute) -> String {
+    format!("{}; foreach ($ownedMatch in $ownedMatches) {{ $ownedMatch | Remove-NetRoute -Confirm:$false -ErrorAction Stop }}; if ($ownedMatches.Count -gt 0) {{ 'removed' }}", exact_route_query(route))
 }
 
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_route_migration_can_undo_a_partial_release() {
+        let released = route();
+        let pending = OwnedRoute {
+            ip: "192.0.2.26".parse().unwrap(),
+            ..released.clone()
+        };
+        let mut changes = Vec::new();
+        let result = remove_recorded_routes(&[released, pending], &mut changes, |script| {
+            if script.contains("192.0.2.25/32") {
+                Ok("removed".into())
+            } else {
+                Err("route table unavailable".into())
+            }
+        });
+        assert_eq!(result.unwrap_err(), "route table unavailable");
+        let mut restored = Vec::new();
+        undo_probe_routes(&changes, |script| {
+            restored.push(script.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(restored[0].contains("New-NetRoute -DestinationPrefix '192.0.2.25/32'"));
+    }
+
     #[test]
     fn gateway_migration_accepts_only_exact_owned_routes_and_preserves_foreign_conflicts() {
         let old = route();
@@ -297,9 +469,38 @@ function Remove-NetRoute {{ [CmdletBinding(SupportsShouldProcess)]param([Paramet
             remove_route_script(&route())
         );
         assert_eq!(
-            powershell(&script).unwrap(),
-            "removed 192.0.2.25/32 7 192.0.2.1 1"
+            powershell(&script).unwrap().lines().collect::<Vec<_>>(),
+            ["removed 192.0.2.25/32 7 192.0.2.1 1", "removed"]
         );
+    }
+
+    #[test]
+    fn rejected_probe_removes_new_route_before_restoring_displaced_owned_route() {
+        let old = route();
+        let new = OwnedRoute {
+            interface: 9,
+            ..old.clone()
+        };
+        let changes = [RouteChange::Removed(old), RouteChange::Added(new)];
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("owned_routes.json");
+        fs::write(&journal, b"updated journal").unwrap();
+        let mut scripts = Vec::new();
+        restore_probe_routes(
+            &journal,
+            Some(b"previous journal".to_vec()),
+            &changes,
+            |script| {
+                scripts.push(script.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(scripts[0].contains("InterfaceIndex -eq 9"));
+        assert!(scripts[0].contains("Remove-NetRoute"));
+        assert!(scripts[1].contains("InterfaceIndex -eq 7"));
+        assert!(scripts[1].contains("New-NetRoute"));
+        assert_eq!(fs::read(journal).unwrap(), b"previous journal");
     }
 
     #[test]

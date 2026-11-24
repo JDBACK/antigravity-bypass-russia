@@ -6,13 +6,118 @@ use std::path::{Path, PathBuf};
 pub const DAILY_ENDPOINT: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const IDE_SETTING: &str = "jetski.cloudCodeUrl";
 
+/// Whether setup may proceed without the regular Cloud Code endpoint because
+/// `apply_all` switches every discovered client to daily right afterwards.
+/// Windows and macOS switch App and CLI through `CLOUD_CODE_URL`. On Linux only
+/// IDE settings change, so App and CLI still need the regular endpoint there.
+pub fn primary_optional() -> bool {
+    use super::detector::{find_asar_in_path, find_targets_in_path, TargetKind};
+
+    if cfg!(any(windows, target_os = "macos")) {
+        return true;
+    }
+    find_installations().iter().all(|install| {
+        let targets = find_targets_in_path(install);
+        find_asar_in_path(install).is_none()
+            && targets
+                .iter()
+                .all(|target| target.kind != TargetKind::AgyCli)
+            && (targets.is_empty()
+                || targets
+                    .iter()
+                    .any(|target| target.kind == TargetKind::IdeMainJs))
+    })
+}
+
+/// What remains for the user after setup skipped the regular endpoint and
+/// `apply_all` switched the clients to daily.
+pub fn primary_skip_hints() -> Vec<String> {
+    use super::detector::{find_targets_in_path, TargetKind};
+
+    let mut hints = Vec::new();
+    let mut paths = Vec::new();
+    let mut has_cli = false;
+    for install in find_installations() {
+        let targets = find_targets_in_path(&install);
+        has_cli |= targets
+            .iter()
+            .any(|target| target.kind == TargetKind::AgyCli);
+        if targets
+            .iter()
+            .any(|target| target.kind == TargetKind::IdeMainJs)
+            && !ide_settings_path(&install).is_some_and(|path| settings_use_daily(&path))
+        {
+            hints.push(format!(
+                "{}: в настройках IDE задан собственный jetski.cloudCodeUrl",
+                install.display()
+            ));
+        }
+        paths.extend(targets.into_iter().map(|target| target.path));
+    }
+    if crate::system::file_lock::running_applications(&paths)
+        .is_ok_and(|running| !running.is_empty())
+    {
+        hints.push(
+            "Перезапустите Antigravity: открытое приложение ещё использует прежний адрес".into(),
+        );
+    }
+    if has_cli {
+        hints.push(if super::endpoint_env::daily_configured() {
+            "CLI: откройте новый терминал, в уже открытых остался прежний CLOUD_CODE_URL".into()
+        } else {
+            "CLI: задан собственный CLOUD_CODE_URL, а основной Cloud Code из этой сети недоступен"
+                .into()
+        });
+    }
+    hints
+}
+
+fn settings_use_daily(path: &Path) -> bool {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| endpoint_value(&text).ok().flatten())
+        .is_some_and(|value| value.as_str() == Some(DAILY_ENDPOINT))
+}
+
+#[test]
+fn daily_settings_must_be_explicit_and_unambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let settings = dir.path().join("settings.json");
+    assert!(!settings_use_daily(&settings));
+    for (text, expected) in [
+        (
+            r#"{"jetski.cloudCodeUrl":"https://daily-cloudcode-pa.googleapis.com"}"#,
+            true,
+        ),
+        (
+            r#"{"jetski.cloudCodeUrl":"https://cloudcode-pa.googleapis.com"}"#,
+            false,
+        ),
+        (
+            r#"{"jetski.cloudCodeUrl":"https://daily-cloudcode-pa.googleapis.com","jetski.cloudCodeUrl":"https://daily-cloudcode-pa.googleapis.com"}"#,
+            false,
+        ),
+        (
+            r#"{"jetski.cloudCodeUrl":"https://daily-cloudcode-pa.googleapis.com.example.org"}"#,
+            false,
+        ),
+        ("{", false),
+    ] {
+        fs::write(&settings, text).unwrap();
+        assert_eq!(settings_use_daily(&settings), expected);
+    }
+}
+
 pub fn apply_all() -> Vec<Result<String, String>> {
-    if let Err(error) = migrate_gateway_settings() {
+    // One discovery for the migration, the IDE loop and the APPDATA checks;
+    // migrating settings files does not change which installations exist.
+    let installs = find_installations();
+    if let Err(error) = migrate_gateway_settings(&installs) {
         return vec![Err(error)];
     }
     let mut notes = Vec::new();
-    for inst in find_installations() {
-        match apply_ide(&inst) {
+    for inst in &installs {
+        match apply_ide(inst) {
             Ok(msg) => notes.push(Ok(format!("{}: {}", inst.display(), msg))),
             Err(e) => notes.push(Err(format!("{}: {}", inst.display(), e))),
         }
@@ -20,7 +125,7 @@ pub fn apply_all() -> Vec<Result<String, String>> {
     // Fresh installs keep settings under APPDATA even if we missed the folder.
     for folder in ["Antigravity", "Antigravity IDE"] {
         if let Some(path) = appdata_settings(folder) {
-            if find_installations()
+            if installs
                 .iter()
                 .any(|p| ide_settings_path(p).as_ref() == Some(&path))
             {
@@ -37,9 +142,9 @@ pub fn apply_all() -> Vec<Result<String, String>> {
 }
 
 /// Restore the settings journalled by 2.3.0/2.3.1 before stopping their gateway.
-fn migrate_gateway_settings() -> Result<(), String> {
+fn migrate_gateway_settings(installs: &[PathBuf]) -> Result<(), String> {
     super::endpoint_env::restore_gateway()?;
-    for path in settings_paths() {
+    for path in settings_paths_for(installs) {
         restore_gateway_profile(&path)?;
     }
     Ok(())
@@ -108,8 +213,8 @@ fn automatic_settings_text(path: &Path) -> Result<Option<String>, String> {
     Ok(Some(text))
 }
 
-pub fn settings_paths() -> Vec<PathBuf> {
-    let mut paths: Vec<_> = find_installations()
+fn settings_paths_for(installs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = installs
         .iter()
         .filter_map(|p| ide_settings_path(p))
         .collect();
@@ -171,36 +276,6 @@ pub fn select_for_test(path: &Path, host: &str) -> Result<(), String> {
         )?;
     }
     Ok(())
-}
-
-fn restore_automatic_overrides() -> Vec<Result<String, String>> {
-    let mut paths: Vec<_> = find_installations()
-        .iter()
-        .filter_map(|p| ide_settings_path(p))
-        .collect();
-    for folder in ["Antigravity", "Antigravity IDE", "Google Antigravity"] {
-        if let Some(path) = appdata_settings(folder) {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    let mut notes = vec![Ok(
-        "Основной Cloud Code имеет проверенный путь; принудительный daily-endpoint не нужен".into(),
-    )];
-    for path in paths {
-        if crate::system::journal::has_record(&path) {
-            notes.push(
-                remove_settings_file(&path)
-                    .map(|_| "Прежние настройки endpoint восстановлены по журналу".into()),
-            );
-        }
-    }
-    notes.push(
-        super::endpoint_env::restore()
-            .map(|_| "CLI: собственный override снят, пользовательское значение сохранено".into()),
-    );
-    notes
 }
 
 pub fn remove_all() -> Vec<String> {
@@ -287,7 +362,7 @@ fn appdata_settings(folder: &str) -> Option<PathBuf> {
     }
 }
 
-fn ide_settings_path(install: &Path) -> Option<PathBuf> {
+fn product_settings_path(install: &Path) -> Option<PathBuf> {
     let product_candidates = [
         install.join("resources").join("app").join("product.json"),
         install
@@ -297,16 +372,25 @@ fn ide_settings_path(install: &Path) -> Option<PathBuf> {
             .join("product.json"),
         install.join("product.json"),
     ];
-    let re = Regex::new(r#""nameShort"[ \t\r\n]*:[ \t\r\n]*"([^"]+)""#).ok();
+    static NAME_SHORT: std::sync::LazyLock<Option<Regex>> = std::sync::LazyLock::new(|| {
+        Regex::new(r#""nameShort"[ \t\r\n]*:[ \t\r\n]*"([^"]+)""#).ok()
+    });
     for product in product_candidates {
         if let Ok(text) = fs::read_to_string(&product) {
-            if let Some(ref re) = re {
+            if let Some(re) = NAME_SHORT.as_ref() {
                 if let Some(cap) = re.captures(&text) {
                     let name = cap.get(1)?.as_str();
                     return appdata_settings(name);
                 }
             }
         }
+    }
+    None
+}
+
+fn ide_settings_path(install: &Path) -> Option<PathBuf> {
+    if let Some(path) = product_settings_path(install) {
+        return Some(path);
     }
     let fallbacks = ["Antigravity", "Antigravity IDE", "Google Antigravity"];
     for f in fallbacks {

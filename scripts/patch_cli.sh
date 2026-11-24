@@ -18,7 +18,8 @@ usage() {
 
 Режимы:
   (по умолчанию)      Найти Antigravity CLI и применить файловый патч (patch-files)
-  --restore, restore  Восстановить оригинальный бинарник CLI из бэкапа (restore-files)
+  --all, all          Применить ко всем найденным файлам Antigravity (CLI, App, IDE)
+  --restore, restore  Восстановить оригинальные файлы из бэкапа (restore-files)
   --status, status    Показать текущий статус патча CLI и системы
   --rebuild           Принудительно пересобрать Rust-движок перед запуском
   -h, --help          Показать эту справку
@@ -26,6 +27,7 @@ EOF
 }
 
 action="patch-files"
+all_targets=0
 rebuild=0
 cli_path=""
 
@@ -45,6 +47,10 @@ while (( $# > 0 )); do
       ;;
     --patch|patch)
       action="patch-files"
+      shift
+      ;;
+    --all|all)
+      all_targets=1
       shift
       ;;
     --rebuild)
@@ -322,8 +328,22 @@ if needs_build; then
   fi
 fi
 
+if (( all_targets == 1 )) && [[ -n $cli_path ]]; then
+  printf '%s\n' 'Нельзя одновременно указывать --all и конкретный путь.' >&2
+  usage >&2
+  exit 2
+fi
+
 if [[ $action == "status" ]]; then
   exec "$engine" status
+fi
+
+if [[ $action == "patch-files" && -t 2 && -z ${AGY_CLI_DISABLE_AUTO_UPDATE:-} ]]; then
+  printf '%s\n' 'Совет: чтобы автообновление agy не затирало патч, задайте AGY_CLI_DISABLE_AUTO_UPDATE=1.' >&2
+fi
+
+if (( all_targets == 1 )); then
+  exec "$engine" "$action"
 fi
 
 resolved_cli=$(resolve_cli_path "$cli_path")

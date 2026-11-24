@@ -3,7 +3,7 @@ use crate::core::patcher::BinaryState;
 use crate::system::env::expand_env_vars;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TargetKind {
     LanguageServer,
     IdeMainJs,
@@ -34,7 +34,7 @@ pub(crate) fn is_agy_cli_name(name: &str) -> bool {
             .is_none_or(|extension| extension == "exe"))
 }
 
-const CLI_NAMES: [&str; 6] = [
+pub(super) const CLI_NAMES: [&str; 6] = [
     "agy.exe",
     "agy",
     "antigravity-cli.exe",
@@ -113,7 +113,21 @@ fn is_already_contained(installs: &[PathBuf], candidate: &Path) -> bool {
 }
 
 pub fn find_installations() -> Vec<PathBuf> {
-    let mut installs = Vec::new();
+    find_installations_with(super::install_paths::saved())
+}
+
+/// Whether discovery finds `path` without the user's saved paths, so that
+/// forgetting a saved path does not hide it from status and rollback.
+pub fn found_automatically(path: &Path) -> bool {
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    find_installations_with(Vec::new()).iter().any(|root| {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+        path.starts_with(&root)
+    })
+}
+
+fn find_installations_with(saved: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut installs: Vec<_> = saved.into_iter().filter(|path| path.exists()).collect();
 
     #[cfg(target_os = "windows")]
     {
@@ -144,6 +158,12 @@ pub fn find_installations() -> Vec<PathBuf> {
             let p = expand_env_vars(c);
             if p.exists() && p.is_dir() && !is_already_contained(&installs, &p) {
                 installs.push(p);
+            }
+        }
+
+        for path in super::windows_installations::find() {
+            if !is_already_contained(&installs, &path) {
+                installs.push(path);
             }
         }
 
@@ -350,10 +370,27 @@ fn cli_search_includes_ide_managed_installations() {
 /// resurrect files or finalize transactions.
 pub fn recover_installations() -> Result<(), String> {
     recover_cli_in_dirs(&cli_search_dirs())?;
+    // An interrupted write can temporarily hide a manually selected file.
+    for path in super::install_paths::saved() {
+        if !path.exists() && path.parent().is_some_and(Path::is_dir) {
+            recover_targets_in_path(&path)?;
+        }
+    }
     for root in find_installations() {
         recover_targets_in_path(&root)?;
     }
     Ok(())
+}
+
+pub fn find_installation_targets(installs: &[PathBuf]) -> Vec<FoundTarget> {
+    let mut seen = std::collections::HashSet::new();
+    installs
+        .iter()
+        .flat_map(|root| find_targets_in_path(root))
+        .filter(|target| {
+            seen.insert(std::fs::canonicalize(&target.path).unwrap_or_else(|_| target.path.clone()))
+        })
+        .collect()
 }
 
 fn recover_cli_in_dirs(dirs: &[PathBuf]) -> Result<(), String> {
@@ -579,7 +616,7 @@ fn regular_file_under(root: &Path, path: &Path) -> bool {
     regular_file(path)
 }
 
-fn native_cli(path: &Path, name: &str) -> bool {
+pub(super) fn native_cli(path: &Path, name: &str) -> bool {
     if !is_agy_cli_name(name) || !regular_file(path) || !native_executable(path) {
         return false;
     }
@@ -864,7 +901,32 @@ fn walk_targets(dir: &Path, depth: usize, max_depth: usize, targets: &mut Vec<Fo
                     | "logs"
                     | "dist"
                     | "obj"
-            ) {
+                    // Electron/VS Code user data: caches, editor history and
+                    // per-workspace state grow with use and hold no executables.
+                    | "CachedData"
+                    | "CachedExtensionVSIXs"
+                    | "CachedProfilesData"
+                    | "History"
+                    | "workspaceStorage"
+                    | "Service Worker"
+                    | "WebStorage"
+                    | "Partitions"
+                    | "Shared Dictionary"
+                    | "ShaderCache"
+                    | "GrShaderCache"
+                    | "GPUPersistentCache"
+                    | "DawnCache"
+                    | "DawnGraphiteCache"
+                    | "DawnWebGPUCache"
+                    // Antigravity agent data in ~/.gemini/antigravity.
+                    | "brain"
+                    | "conversations"
+                    | "annotations"
+                    | "scratch"
+                    | "crashes"
+                    | "persistent_terminals"
+            ) || file_name.ends_with(".ag-backups")
+            {
                 continue;
             }
             walk_targets(&entry.path(), depth + 1, max_depth, targets);
@@ -920,6 +982,36 @@ fn update_component_state(current: &mut Option<BinaryState>, new_state: BinarySt
 #[cfg(test)]
 mod detection_tests {
     use super::*;
+
+    #[test]
+    fn walk_skips_user_data_trees_but_finds_unconventional_install_folders() {
+        let root = tempfile::tempdir().unwrap();
+        let wanted = root
+            .path()
+            .join("custom/layout/resources/app/extensions/antigravity/bin");
+        std::fs::create_dir_all(&wanted).unwrap();
+        std::fs::write(wanted.join("language_server_windows_x64.exe"), b"x").unwrap();
+        for skipped in [
+            "brain/123/bin",
+            "User/History/abc",
+            "User/workspaceStorage/hash",
+            "CachedData/1.0",
+            "language_server.exe.ag-backups",
+        ] {
+            let dir = root.path().join(skipped);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("language_server_windows_x64.exe"), b"x").unwrap();
+        }
+        let mut targets = Vec::new();
+        walk_targets(root.path(), 0, 8, &mut targets);
+        assert_eq!(
+            targets.len(),
+            1,
+            "{:?}",
+            targets.iter().map(|t| &t.path).collect::<Vec<_>>()
+        );
+        assert!(targets[0].path.starts_with(&wanted));
+    }
 
     fn pending_fixture(path: &Path, bytes: &[u8]) -> PathBuf {
         let name = path.file_name().unwrap().to_string_lossy();
@@ -1180,6 +1272,53 @@ mod detection_tests {
         assert_eq!(status.ide_status, Some(BinaryState::Unknown));
     }
     #[test]
+    fn app_archive_without_ide_code_does_not_set_ide_status() {
+        fn archive(dir: &str) -> Vec<u8> {
+            let js = b"// main process";
+            let header = serde_json::to_vec(&serde_json::json!({"files": {dir: {"files": {
+                "main.js": {"size": js.len(), "offset": "0"}}}}}))
+            .unwrap();
+            let header_size = 8 + (header.len() + 3) / 4 * 4;
+            let mut data = Vec::new();
+            for value in [
+                4,
+                header_size as u32,
+                (header_size - 4) as u32,
+                header.len() as u32,
+            ] {
+                data.extend(value.to_le_bytes());
+            }
+            data.extend(header);
+            data.resize(8 + header_size, 0);
+            data.extend(js);
+            data
+        }
+        let root = tempfile::tempdir().unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let asar = root.path().join("resources/app.asar");
+        std::fs::create_dir_all(asar.parent().unwrap()).unwrap();
+
+        // The separate Antigravity app: Electron code under dist/.
+        std::fs::write(&asar, archive("dist")).unwrap();
+        let status = status_for_installations(&roots);
+        assert_eq!(status.ide_status, None);
+        assert!(status.ide_installations.is_empty());
+
+        // An IDE archive with an unrecognised main.js still needs a check.
+        std::fs::write(&asar, archive("out")).unwrap();
+        assert_eq!(
+            status_for_installations(&roots).ide_status,
+            Some(BinaryState::Unknown)
+        );
+
+        // An unreadable archive is not silently dropped either.
+        std::fs::write(&asar, b"not an archive").unwrap();
+        assert_eq!(
+            status_for_installations(&roots).ide_status,
+            Some(BinaryState::Unknown)
+        );
+    }
+    #[test]
     fn cli_scripts_and_backups_are_not_binary_patch_targets() {
         let root = tempfile::tempdir().unwrap();
         for name in ["agy", "agy-helper.js", "agy-x64.exe.bak"] {
@@ -1308,6 +1447,7 @@ pub fn get_quick_status() -> SystemComponentsStatus {
 fn status_for_installations(installs: &[PathBuf]) -> SystemComponentsStatus {
     let mut status = SystemComponentsStatus::default();
     status.has_installations = !installs.is_empty();
+    let mut scanned = std::collections::HashSet::new();
 
     for inst in installs {
         let app = if inst.join("Contents").is_dir() {
@@ -1349,6 +1489,19 @@ fn status_for_installations(installs: &[PathBuf]) -> SystemComponentsStatus {
         }
         let targets = find_targets_in_path(inst);
         for t in targets {
+            // A CLI on PATH can also sit under an installation root; scan each
+            // large executable once per status refresh.
+            let canonical = std::fs::canonicalize(&t.path).unwrap_or_else(|_| t.path.clone());
+            if !scanned.insert((canonical, t.kind)) {
+                continue;
+            }
+            // The separate Antigravity app also ships resources/app.asar; an
+            // archive without IDE code says nothing about the IDE.
+            if t.kind == TargetKind::IdeAsar
+                && crate::core::asar::has_ide_entry(&t.path) == Some(false)
+            {
+                continue;
+            }
             let state = crate::core::patcher::check_target_state(&t);
             match t.kind {
                 TargetKind::LanguageServer => {

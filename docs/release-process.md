@@ -1,28 +1,23 @@
-# Подготовка выпуска 2.4.0
+# Выпуск релиза
 
-Подготовка ведётся в `codex/release-2.4.0`. До отдельной команды владельца
-публичный PR не сливается, тег и GitHub Release не создаются.
+## Порядок
 
-## Состав
-
-- Исправления NRPT, закрытия macOS, некорректного PATH, контекста пользователя,
-  маршрутов, hosts и диагностики из `478fd05` и `579f690`.
-- Обновления провайдеров из PR #20 (`a3b362a`) с исправленным общим сроком DoH
-  и правильным указанием источника ошибки. Автоудаление hosts исключено.
-- Переключение endpoint только после успешной настройки сети.
-- Версия `2.4.0` в Cargo.toml/Cargo.lock и [заметки выпуска](releases/v2.4.0.md).
-
-При переносе изменений в публичный репозиторий сохранить соавторство из `6a17d97`.
-Если коммиты объединяются, добавить в итоговый коммит трейлер
-`Co-authored-by: HyperRamzey <HyperRamzey@users.noreply.github.com>`.
-GitHub уже связывает это соавторство с аккаунтом `HyperRamzey` в приватной ветке.
+1. В `main` закрытого `antigravity-bypass-russia-dev` готовы версия в
+   `Cargo.toml`/`Cargo.lock` и заметки `docs/releases/vX.Y.Z.md`: этот файл
+   становится страницей релиза на GitHub.
+2. Проверки ниже выполнены локально: в dev GitHub Actions отключены.
+3. Публичный `main` обновляется до `main` из dev простым продвижением
+   (fast-forward), без отдельных коммитов в публичном репозитории.
+4. В публичном репозитории ставится тег `vX.Y.Z`. Workflow `Release Build`
+   собирает все платформы, проверяет файлы и создаёт черновик релиза.
+5. Черновик проверяют и публикуют вручную.
 
 ## Проверки
 
 ```text
 rustfmt --edition 2021 --check src/main.rs build.rs
 cargo test --locked --bin antigravity-bypass-russia
-cargo test --locked --test socket_tests
+cargo test --locked --test cli
 python tests/verify_cli_profiles.py
 python tests/verify_wrappers.py
 python tests/verify_macos_bundle.py
@@ -35,7 +30,7 @@ python tests/verify_macos_source_bundle.py
 версия, справка, status и сохранение локальной диагностики без включения обхода.
 
 Workflow `Regression checks` запускает тесты на Windows, Apple Silicon и Intel,
-включая `socket_tests`. Его можно запустить вручную для выбранной ветки без сборки
+включая проверку самой программы (`tests/cli.rs`). Его можно запустить вручную для выбранной ветки без сборки
 релиза. DNS-тесты используют управляемое время, чтобы проверять порядок ответов
 и сроки ожидания независимо от загрузки runner. Проверка файлов на Mac повторяет
 кратковременный конфликт; постоянная занятость и ошибки проверки блокируют запись.
@@ -44,22 +39,55 @@ Workflow `Regression checks` запускает тесты на Windows, Apple S
 на Mac. Если GitHub отклонил задание до первого шага из-за лимита оплаты,
 оно не считается результатом тестов.
 
+### Совместимость с версиями Google
+
+`python tests/verify_upstream_artifacts.py` проверяет официальные Linux x64
+архивы App, IDE и CLI из групп `current` и `previous` в
+`tests/upstream-versions.json`. На Linux x64 также запускается `agy --version`.
+Проверка выполняется в CI для PR и при сборке релиза. Проверки профилей CLI
+и отката используют предыдущий набор и исторические фикстуры.
+
+Workflow `Monitor Google Antigravity versions` ежедневно в 06:23 UTC сверяет
+текущую группу с официальными загрузками и манифестами. Его можно запустить
+вручную на GitHub или локально через `python tests/verify_upstream_versions.py`.
+При изменении сборки сначала проверьте новый архив, затем обновите его версию
+и контрольную сумму в `current`, сохранив предыдущую проверенную сборку в `previous`.
+
+## Проверки без GitHub Actions
+
+В закрытом `antigravity-bypass-russia-dev` GitHub Actions отключены в настройках
+репозитория (минуты для закрытых репозиториев платные). Файлы workflow не
+изменены, поэтому в публичном репозитории CI работает как прежде. Перед
+публикацией проверки выполняются локально: Windows нативно, Linux в WSL 2
+по шагам из [проверки Linux](linux-compatibility.md#воспроизведение), macOS через
+`cargo check --target aarch64-apple-darwin` и при возможности нативно на Mac.
+Включить Actions в dev снова можно в Settings → Actions → General.
+
 ## Тестовая сборка без публикации
 
 Workflow `Release Build`, запущенный вручную на тестовой ветке закрытого
 `antigravity-bypass-russia-dev`, собирает Windows x64, macOS ARM64 и macOS Intel.
+Пока Actions в dev отключены, для такой сборки их нужно временно включить.
 Сборки проходят нативные тесты и проверку версии. Задание `Package release
 candidate` собирает единый `.sh`, сверяет вложенные движки и контрольные суммы.
 
 Артефакт `release-candidate` содержит только:
 
-- `antigravity-bypass-russia.exe`
-- `unlock_and_restore.ps1`
-- `unlock_and_restore.sh` с готовыми движками Intel и Apple Silicon
+- `antigravity-bypass-windows.exe`
+- `antigravity-bypass-macos.sh` с готовыми движками Intel и Apple Silicon
+- `antigravity-bypass-linux-x64`, `antigravity-bypass-linux-arm64` и
+  `antigravity-bypass-linux-x64.deb`
+- `install.sh`
+- копии под именами 2.5.0 (`antigravity-bypass-russia.exe`, `unlock_and_restore.sh`,
+  `antigravity-bypass-russia-linux-x64`, `antigravity-bypass-russia-linux-arm64`,
+  `antigravity-bypass-russia-linux-x64.deb`), чтобы старые ссылки работали; их
+  убирают в 3.2
 - `SHA256SUMS.txt`
 
-В GitHub Release публикуются только три запускаемых файла. `SHA256SUMS.txt`
-остаётся во внутреннем артефакте для проверки сборки.
+В GitHub Release публикуются все файлы, кроме `SHA256SUMS.txt`: он остаётся во
+внутреннем артефакте для проверки сборки. `unlock_and_restore.ps1` с 3.0.0 не
+публикуется: он только запускает `.exe`, лежащий рядом, и нужен для запуска из
+репозитория.
 
 Вручную запущенная сборка ветки пропускает `Create GitHub Release`. Создание
 черновика релиза предусмотрено только для тега `v*`; даже этот шаг выполняется

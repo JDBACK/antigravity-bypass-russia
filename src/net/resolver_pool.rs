@@ -1,6 +1,11 @@
 //! One configuration snapshot for both UDP and RFC 8484 exchanges.
-use super::{client, config, dns_https, resolvers};
-use std::{net::Ipv4Addr, sync::mpsc, time::Duration};
+use super::{client, config, dns_https};
+use std::{
+    net::Ipv4Addr,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
+};
 
 pub const UDP_TIMEOUT: Duration = Duration::from_millis(800);
 pub const BUDGET: Duration = Duration::from_millis(2800);
@@ -38,33 +43,18 @@ impl Provider {
                 .ok()
                 .map(|reply| (reply, None)),
             Transport::Udp(ips) => {
-                let (tx, rx) = mpsc::channel();
-                for ip in ips {
-                    let ip = *ip;
-                    let query = query.to_vec();
-                    let tx = tx.clone();
-                    std::thread::spawn(move || {
-                        if let Ok(reply) = client::query_raw_via(&query, ip, interface, UDP_TIMEOUT)
-                        {
-                            if client::is_successful_response(&reply) {
-                                let _ = tx.send((reply, Some(ip)));
-                            }
-                        }
-                    });
-                }
-                drop(tx);
-                let deadline = std::time::Instant::now() + UDP_TIMEOUT + Duration::from_millis(50);
+                // One socket for every address of this provider; the first
+                // reply with an address wins, an empty one is the fallback.
                 let wants_address = matches!(client::question_type(query), Some(1 | 28));
-                let mut empty = None;
-                while let Ok(result) =
-                    rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                {
-                    if !wants_address || !client::answer_addrs(&result.0).is_empty() {
-                        return Some(result);
-                    }
-                    empty = Some(result);
-                }
-                empty
+                client::query_servers(
+                    query,
+                    ips,
+                    interface,
+                    UDP_TIMEOUT,
+                    client::is_successful_response,
+                    |reply| !wants_address || !client::answer_addrs(reply).is_empty(),
+                )
+                .map(|(reply, ip)| (reply, Some(ip)))
             }
         }
     }
@@ -72,17 +62,14 @@ impl Provider {
 
 pub fn from_config(config: &config::Config) -> Result<Vec<Provider>, String> {
     config::validate(config)?;
-    let mut providers: Vec<_> = resolvers::PROVIDERS
+    let mut providers: Vec<_> = config
+        .extra_udp
         .iter()
         .map(|p| Provider {
-            name: p.name.into(),
-            transport: Transport::Udp(p.v4.iter().filter_map(|s| s.parse().ok()).collect()),
+            name: p.name.clone(),
+            transport: Transport::Udp(p.addresses.clone()),
         })
         .collect();
-    providers.extend(config.extra_udp.iter().map(|p| Provider {
-        name: p.name.clone(),
-        transport: Transport::Udp(p.addresses.clone()),
-    }));
     providers.extend(config.doh.iter().map(|p| Provider {
         name: p.name.clone(),
         transport: Transport::Doh(p.clone()),
@@ -109,6 +96,86 @@ pub fn load() -> Result<Vec<Provider>, String> {
     from_config(&config::load()?)
 }
 
+/// A validated pool and the identity that DNS cache entries are keyed by.
+pub struct Snapshot {
+    pub providers: Vec<Provider>,
+    pub fingerprint: Arc<str>,
+}
+
+impl Snapshot {
+    pub fn new(providers: Vec<Provider>) -> Self {
+        let fingerprint = format!("{providers:?}").into();
+        Self {
+            providers,
+            fingerprint,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(FileStamp {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+struct CachedSnapshot {
+    context: Option<FileStamp>,
+    config_path: PathBuf,
+    config: Option<FileStamp>,
+    snapshot: Arc<Snapshot>,
+}
+
+static SNAPSHOT: Mutex<Option<CachedSnapshot>> = Mutex::new(None);
+
+/// The relay resolves every DNS packet through the pool. Reuse the parsed
+/// configuration while network.json and the relay context are unchanged: two
+/// metadata calls replace two file reads, JSON parsing and validation.
+pub fn load_shared() -> Result<Arc<Snapshot>, String> {
+    cached_snapshot(&SNAPSHOT, &config::context_path(), config::path, load)
+}
+
+fn cached_snapshot(
+    cache: &Mutex<Option<CachedSnapshot>>,
+    context_path: &Path,
+    config_path: impl FnOnce() -> PathBuf,
+    load: impl FnOnce() -> Result<Vec<Provider>, String>,
+) -> Result<Arc<Snapshot>, String> {
+    let context = file_stamp(context_path);
+    let mut cached = cache.lock().map_err(|e| e.to_string())?;
+    if let Some(entry) = cached.as_ref() {
+        if entry.context == context && file_stamp(&entry.config_path) == entry.config {
+            return Ok(Arc::clone(&entry.snapshot));
+        }
+    }
+    // Stamps are taken before reading, so a write during the reload is seen
+    // as a change by the next lookup instead of hiding behind the cache.
+    let config_path = config_path();
+    let config_stamp = file_stamp(&config_path);
+    let snapshot = Arc::new(Snapshot::new(load()?));
+    *cached = Some(CachedSnapshot {
+        context,
+        config_path,
+        config: config_stamp,
+        snapshot: Arc::clone(&snapshot),
+    });
+    Ok(snapshot)
+}
+
+pub fn forget_shared() {
+    if let Ok(mut cached) = SNAPSHOT.lock() {
+        *cached = None;
+    }
+}
+
+#[cfg(windows)]
 pub fn bootstrap_v4() -> Result<Vec<Ipv4Addr>, String> {
     Ok(load()?
         .into_iter()
@@ -130,13 +197,65 @@ pub fn bootstrap_v4() -> Result<Vec<Ipv4Addr>, String> {
 mod tests {
     use super::*;
     #[test]
+    fn relay_pool_is_reused_until_network_json_or_context_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = dir.path().join("network-user.json");
+        let config_path = dir.path().join("network.json");
+        std::fs::write(&context, b"{}").unwrap();
+        let cache = Mutex::new(None);
+        let loads = std::cell::Cell::new(0);
+        let lookup = || {
+            cached_snapshot(
+                &cache,
+                &context,
+                || config_path.clone(),
+                || {
+                    loads.set(loads.get() + 1);
+                    from_config(&config::Config::default())
+                },
+            )
+            .unwrap()
+        };
+        let first = lookup();
+        let second = lookup();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(loads.get(), 1);
+        std::fs::write(&config_path, b"{\"doh\":[]}").unwrap();
+        lookup();
+        assert_eq!(loads.get(), 2);
+        lookup();
+        assert_eq!(loads.get(), 2);
+        std::fs::write(&config_path, b"{\"doh\":[], \"extra_udp\":[]}").unwrap();
+        lookup();
+        assert_eq!(loads.get(), 3);
+        std::fs::write(&context, b"{\"directory\":\"x\"}").unwrap();
+        lookup();
+        assert_eq!(loads.get(), 4);
+        assert!(cached_snapshot(
+            &cache,
+            &context,
+            || config_path.clone(),
+            || Err("bad".into())
+        )
+        .is_ok());
+        std::fs::remove_file(&config_path).unwrap();
+        assert!(cached_snapshot(
+            &cache,
+            &context,
+            || config_path.clone(),
+            || Err("bad".into())
+        )
+        .is_err());
+        assert_eq!(loads.get(), 4);
+    }
+    #[test]
     fn configured_transports_order_and_disabling_are_shared() {
         let mut c = config::Config::default();
         c.extra_udp.push(config::UdpProvider {
             name: "custom".into(),
             addresses: vec!["192.0.2.1".parse().unwrap()],
         });
-        c.disabled_providers = vec!["geohide.ru".into()];
+        c.disabled_providers = vec!["eu.geohide.ru".into()];
         c.provider_order = vec!["dns-ai.ru".into(), "custom".into()];
         let pool = from_config(&c).unwrap();
         assert_eq!(
@@ -155,9 +274,9 @@ mod tests {
         assert!(from_config(&c).is_err());
     }
     #[test]
-    fn names_cannot_shadow_builtins_and_all_disabled_is_invalid() {
+    fn duplicate_provider_names_and_all_disabled_are_invalid() {
         let mut c = config::Config::default();
-        c.doh[0].name = "geohide.ru".into();
+        c.doh[0].name = c.doh[1].name.clone();
         assert!(from_config(&c).is_err());
         c = config::Config::default();
         c.disabled_providers = from_config(&c)
@@ -178,10 +297,7 @@ mod tests {
             Duration::ZERO,
         );
         let mut config = config::Config::default();
-        config.disabled_providers = resolvers::PROVIDERS
-            .iter()
-            .map(|p| p.name.to_string())
-            .collect();
+        config.doh.truncate(1);
         config.doh[0].url = format!("https://localhost:{}/dns-query", addr.port());
         config.doh[0].bootstrap = vec![addr.ip()];
         let pool = from_config(&config).unwrap();
